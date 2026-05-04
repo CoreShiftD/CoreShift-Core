@@ -124,6 +124,21 @@ impl Fd {
         self.read_raw(buf.as_mut_ptr(), buf.len())
     }
 
+    /// Seek to an absolute file offset.
+    pub fn seek_set(&self, offset: i64) -> Result<u64, CoreError> {
+        loop {
+            let pos = unsafe { libc::lseek(self.0, offset as libc::off_t, libc::SEEK_SET) };
+            if pos < 0 {
+                let e = errno();
+                if e == libc::EINTR {
+                    continue;
+                }
+                return Err(CoreError::sys(e, "lseek"));
+            }
+            return Ok(pos as u64);
+        }
+    }
+
     /// Write bytes from a slice.
     ///
     /// Returns `Ok(None)` if the operation would block (`EAGAIN`).

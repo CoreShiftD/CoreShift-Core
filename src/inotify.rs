@@ -83,6 +83,12 @@ pub fn add_watch(fd: &Fd, path: &str, mask: u32) -> Result<i32, CoreError> {
     Ok(wd)
 }
 
+/// Remove an existing watch descriptor from an inotify instance.
+pub fn remove_watch(fd: &Fd, wd: i32) -> Result<(), CoreError> {
+    let ret = unsafe { libc::inotify_rm_watch(fd.raw(), wd) };
+    syscall_ret(ret, "inotify_rm_watch")
+}
+
 /// Read all available inotify events from the descriptor.
 ///
 /// This function drains the inotify file descriptor until no more events
