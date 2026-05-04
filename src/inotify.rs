@@ -85,7 +85,13 @@ pub fn add_watch(fd: &Fd, path: &str, mask: u32) -> Result<i32, CoreError> {
 
 /// Remove an existing watch descriptor from an inotify instance.
 pub fn remove_watch(fd: &Fd, wd: i32) -> Result<(), CoreError> {
-    let ret = unsafe { libc::inotify_rm_watch(fd.raw(), wd) };
+    #[cfg(target_os = "android")]
+    let raw_wd = u32::try_from(wd).map_err(|_| CoreError::sys(libc::EINVAL, "inotify_rm_watch"))?;
+
+    #[cfg(not(target_os = "android"))]
+    let raw_wd = wd;
+
+    let ret = unsafe { libc::inotify_rm_watch(fd.raw(), raw_wd) };
     syscall_ret(ret, "inotify_rm_watch")
 }
 
