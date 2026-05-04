@@ -1,0 +1,15 @@
+[package]
+name = "coreshift-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Low-level Linux and Android systems primitives for CoreShift"
+license = "MPL-2.0"
+repository = "https://github.com/CoreShiftD/CoreShift-Core"
+homepage = "https://github.com/CoreShiftD/CoreShift-Core"
+readme = "README.md"
+keywords = ["android", "linux", "procfs", "inotify", "epoll"]
+categories = ["os::linux-apis", "filesystem"]
+
+[dependencies]
+libc = { version = "0.2", default-features = false }
