@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run tests
+        run: cargo test -j 1
+
+      - name: Run clippy
+        run: cargo clippy -j 1 --all-targets --all-features -- -D warnings
+
+      - name: Build docs
+        run: cargo doc --no-deps
+
+      - name: Check Android aarch64
+        run: cargo check --target aarch64-linux-android
+
+      - name: Check Android armv7
+        run: cargo check --target armv7-linux-androideabi
+
+      - name: Build Android aarch64 when NDK linker is available
+        run: |
+          NDK_CLANG="${ANDROID_NDK_HOME:-}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          if [ -n "${ANDROID_NDK_HOME:-}" ] && [ -x "$NDK_CLANG" ]; then
+            CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_CLANG" \
+              cargo build --target aarch64-linux-android
+          else
+            echo "Android NDK clang not available via ANDROID_NDK_HOME; skipped Android aarch64 link build"
+          fi
+
+      - name: Build Android armv7 when NDK linker is available
+        run: |
+          NDK_CLANG="${ANDROID_NDK_HOME:-}/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang"
+          if [ -n "${ANDROID_NDK_HOME:-}" ] && [ -x "$NDK_CLANG" ]; then
+            CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER="$NDK_CLANG" \
+              cargo build --target armv7-linux-androideabi
+          else
+            echo "Android NDK clang not available via ANDROID_NDK_HOME; skipped Android armv7 link build"
+          fi
