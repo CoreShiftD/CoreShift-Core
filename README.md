@@ -19,6 +19,8 @@ behavior, package discovery, daemon protocols, or preload rules.
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md)
+- [I/O Subsystem](docs/IO_SUBSYSTEM.md)
+- [Signal Handling](docs/SIGNAL_HANDLING.md)
 - [Preload primitives](docs/PRELOAD_PRIMITIVES.md)
 - [Testing](docs/TESTING.md)
 

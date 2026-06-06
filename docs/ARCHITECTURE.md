@@ -54,6 +54,38 @@ range for policy reasons, or decide whether a preload is desirable.
 When a platform primitive is unsupported, Core returns an error such as `ENOSYS`
 so the caller can decide whether to skip, fall back, or fail.
 
+## Subsystems
+
+### Process Spawning (`spawn`)
+
+Core provides explicit control over process creation via `posix_spawn` or `fork/exec`.
+
+- **Explicit Backends**: Callers must choose a `SpawnBackend`. Core does not silently switch backends based on capability; it returns an error if a backend cannot fulfill the requested `SpawnOptions`.
+- **FD Policy**: Child file descriptor inheritance is controlled through `SpawnFdPolicy`. Core defaults to `CloexecOnly` to prevent accidental descriptor leakage.
+- **Bounded Output**: Output capture is combined (stdout + stderr) and strictly bounded to prevent memory exhaustion by runaway processes.
+
+### Reactor and I/O (`reactor`, `io`)
+
+Core implements a lightweight, edge-triggered `epoll` reactor.
+
+- **Non-blocking by Default**: Reactor primitives are designed for non-blocking operations.
+- **Explicit Readiness**: Callers must drain descriptors until `EAGAIN` to satisfy the edge-triggered contract.
+- **Stateless Orchestration**: `DrainState` manages the bookkeeping of multiple process pipes without owning the reactor or the thread.
+
+### Signal Handling (`signal`)
+
+Core provides a centralized shutdown coordination mechanism.
+
+- **Shared State**: `install_shutdown_flag` uses a process-global atomic pointer to signal shutdown to the caller's main loop.
+- **No Signal Policy**: Core installs handlers for `SIGINT` and `SIGTERM` but does not decide how the application should exit.
+
+### Logging (`log`)
+
+Logging is a backend-agnostic facade designed for zero global mutable state.
+
+- **Immutability**: The default logging path uses compile-time dispatch to the platform's primary backend (Android `liblog` or `stderr`).
+- **Explicit Instances**: Dynamic backend selection (e.g., for silencing specific components or redirection) requires an explicit `Logger` instance.
+
 ## Maintenance Notes
 
 Keep new APIs primitive-shaped. If an API needs Android package metadata,
