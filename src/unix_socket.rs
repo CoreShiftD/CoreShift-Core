@@ -96,8 +96,56 @@ pub struct PeerCred {
 impl UnixListenerFd {
     /// Accept one non-blocking client.
     ///
+    /// ### Fork Safety
+    /// The listener's file descriptor is `O_CLOEXEC` and will be closed in the
+    /// child after `exec`.
+    ///
+    /// ### Errors
+    /// - `EAGAIN`/`EWOULDBLOCK`: No connection is pending.
+    /// - `ECONNABORTED`: A connection was aborted before it could be accepted.
+    /// - `EMFILE`: Process limit on open file descriptors hit.
+    /// - `ENFILE`: System-wide limit on open files hit.
+    ///
     /// Returns `Ok(None)` if no client is ready.
     pub fn accept(&self) -> Result<Option<UnixStreamFd>, CoreError> {
+        self.accept_timeout(0)
+    }
+
+    /// Accept a client with a raw timeout in milliseconds.
+    ///
+    /// - `-1`: Block indefinitely until a client connects.
+    /// - `0`: Return immediately (equivalent to [`Self::accept`]).
+    /// - `> 0`: Wait up to the specified milliseconds.
+    ///
+    /// ### Errors
+    /// Returns the same errors as [`Self::accept`], or `poll(2)` errors.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use coreshift_core::unix_socket::{self, UnixListenerFd, UnixSocketAddr, UnixSocketBindOptions};
+    /// # let listener = unix_socket::bind_unix_listener(UnixSocketAddr::Abstract(b"test"), UnixSocketBindOptions::default()).unwrap();
+    /// let stream = listener.accept_timeout(1000).unwrap();
+    /// ```
+    pub fn accept_timeout(&self, timeout_ms: i32) -> Result<Option<UnixStreamFd>, CoreError> {
+        if timeout_ms != 0 {
+            let mut pollfd = libc::pollfd {
+                fd: self.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ret = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+            if ret < 0 {
+                let e = errno();
+                if e == libc::EINTR {
+                    return Ok(None);
+                }
+                return Err(CoreError::sys(e, "poll(accept)"));
+            }
+            if ret == 0 {
+                return Ok(None);
+            }
+        }
+
         loop {
             let fd = unsafe {
                 libc::accept4(
@@ -127,6 +175,21 @@ impl UnixListenerFd {
 
 impl UnixStreamFd {
     /// Return peer credentials when the platform supports `SO_PEERCRED`.
+    ///
+    /// ### Errors
+    /// - `EBADF`: The file descriptor is invalid.
+    /// - `ENOPROTOOPT`: `SO_PEERCRED` is not supported by the socket.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use coreshift_core::unix_socket::UnixStreamFd;
+    /// # fn example(stream: UnixStreamFd) {
+    /// let creds = stream.peer_cred().unwrap();
+    /// if let Some(c) = creds {
+    ///     println!("Peer UID: {}", c.uid);
+    /// }
+    /// # }
+    /// ```
     pub fn peer_cred(&self) -> Result<Option<PeerCred>, CoreError> {
         peer_cred_raw(&self.fd)
     }
@@ -135,6 +198,9 @@ impl UnixStreamFd {
     ///
     /// `Ok(None)` means no pending socket error was reported. `Ok(Some(code))`
     /// returns the raw connect error without making a policy decision.
+    ///
+    /// ### Errors
+    /// - `EBADF`: The file descriptor is invalid.
     pub fn check_connect_error(&self) -> Result<Option<i32>, CoreError> {
         let mut code: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
@@ -155,6 +221,10 @@ impl UnixStreamFd {
     ///
     /// Returns the stream when `SO_ERROR` is clear; otherwise returns the raw
     /// socket error as [`CoreError`].
+    ///
+    /// ### Errors
+    /// Returns the same errors as [`Self::check_connect_error`], or the
+    /// pending connection error itself.
     pub fn finish_connect(self) -> Result<Self, CoreError> {
         match self.check_connect_error()? {
             None => Ok(self),
@@ -164,6 +234,20 @@ impl UnixStreamFd {
 }
 
 /// Bind and listen on a non-blocking Unix stream socket.
+/// Bind a new Unix domain stream listener.
+///
+/// The socket is created with `SOCK_CLOEXEC` set.
+///
+/// ### Fork Safety
+/// The socket is `O_CLOEXEC` and will be closed in the child after `exec`.
+///
+/// ### Errors
+/// - `EACCES`: Permission denied for a component of the path.
+/// - `EADDRINUSE`: The address is already in use.
+/// - `EINVAL`: Invalid address.
+/// - `ELOOP`: Too many symbolic links encountered.
+/// - `ENAMETOOLONG`: Path is too long.
+/// - `ENOENT`: A component of the path prefix does not exist.
 pub fn bind_unix_listener(
     addr: UnixSocketAddr<'_>,
     opts: UnixSocketBindOptions,
@@ -202,6 +286,15 @@ pub fn bind_unix_listener(
 }
 
 /// Connect a non-blocking Unix stream socket.
+///
+/// ### Fork Safety
+/// The socket is `O_CLOEXEC` and will be closed in the child after `exec`.
+///
+/// ### Errors
+/// - `EACCES`: Permission denied.
+/// - `ECONNREFUSED`: No one listening on the remote address.
+/// - `EINPROGRESS`: Connection is in progress.
+/// - `ENOENT`: The socket path does not exist.
 pub fn connect_unix_stream(addr: UnixSocketAddr<'_>) -> Result<UnixConnectResult, CoreError> {
     let encoded = UnixSockAddr::new(addr, "unix connect address")?;
     let fd = new_unix_stream_socket()?;
@@ -227,6 +320,11 @@ pub fn connect_unix_stream(addr: UnixSocketAddr<'_>) -> Result<UnixConnectResult
 }
 
 /// Change mode bits on a Unix socket filesystem path.
+///
+/// ### Errors
+/// - `EACCES`: Permission denied.
+/// - `ENOENT`: The socket path does not exist.
+/// - `EPERM`: The caller does not own the file.
 pub fn chmod_unix_socket(addr: UnixSocketAddr<'_>, mode: u32) -> Result<(), CoreError> {
     match addr {
         UnixSocketAddr::Path(path) => {
@@ -252,6 +350,9 @@ pub fn chmod_socket_path(path: impl AsRef<Path>, mode: u32) -> Result<(), CoreEr
     chmod_unix_socket(UnixSocketAddr::Path(path.as_ref()), mode)
 }
 
+/// Connect to a Unix domain stream socket.
+///
+/// The socket is created with `SOCK_CLOEXEC` and `SOCK_NONBLOCK` set.
 fn new_unix_stream_socket() -> Result<Fd, CoreError> {
     let fd = unsafe {
         libc::socket(

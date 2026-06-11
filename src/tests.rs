@@ -117,6 +117,36 @@ fn test_log_backend_selection() {
 }
 
 #[test]
+#[ignore]
+fn test_signalfd_new() {
+    use crate::signal::{SignalRuntime, SIGUSR1};
+    use crate::reactor::Reactor;
+
+    let signals = SignalRuntime::set_with(&[SIGUSR1]).unwrap();
+
+    // Block the signal so it can be read from signalfd
+    let old_mask = SignalRuntime::block_current_thread(&signals).unwrap();
+
+    let sfd = SignalRuntime::signalfd_new(&signals).unwrap();
+    let mut reactor = Reactor::new().unwrap();
+    let token = reactor.add(&sfd, true, false).unwrap();
+
+    // Send signal to self
+    unsafe {
+        libc::kill(libc::getpid(), SIGUSR1);
+    }
+
+    let mut events = Vec::new();
+    let n = reactor.wait(&mut events, 1, 1000).unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(events[0].token, token);
+    assert!(events[0].readable);
+
+    // Clean up
+    SignalRuntime::restore_current_thread(&old_mask).unwrap();
+}
+
+#[test]
 fn test_decode_inotify_events() {
     // Mock multiple inotify_event records.
     let mut buf = Vec::new();

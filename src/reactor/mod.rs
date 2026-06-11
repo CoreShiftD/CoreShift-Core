@@ -23,6 +23,12 @@ fn errno() -> i32 {
 ///
 /// `Fd` is move-only. Constructing one from a raw descriptor transfers close
 /// ownership to `Fd`; do not also close the raw descriptor elsewhere.
+///
+/// ### Fork Safety
+/// `Fd` instances created by Core usually have `O_CLOEXEC` set. If the process
+/// forks, the descriptor will be inherited by the child but will be closed
+/// automatically upon `exec`. Callers that need a descriptor to survive `exec`
+/// must clear the flag manually.
 pub struct Fd(RawFd);
 
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -58,14 +64,28 @@ impl Fd {
         Self::new(fd, op)
     }
 
-    /// Create a non-blocking `eventfd`.
+    /// Create a non-blocking `eventfd` with `EFD_CLOEXEC`.
+    ///
+    /// The descriptor is created with `FD_CLOEXEC` set.
+    ///
+    /// ### Errors
+    /// - `EINVAL`: `init` is invalid.
+    /// - `EMFILE`: Process limit on open file descriptors hit.
+    /// - `ENFILE`: System-wide limit on open files hit.
     pub fn eventfd(init: u32) -> Result<Self, CoreError> {
         let fd = unsafe { libc::eventfd(init, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         syscall_ret(fd, "eventfd")?;
         Self::new(fd, "eventfd")
     }
 
-    /// Create a non-blocking `timerfd` using `CLOCK_MONOTONIC`.
+    /// Create a non-blocking `timerfd` using `CLOCK_MONOTONIC` with `TFD_CLOEXEC`.
+    ///
+    /// The descriptor is created with `FD_CLOEXEC` set.
+    ///
+    /// ### Errors
+    /// - `EMFILE`: Process limit on open file descriptors hit.
+    /// - `ENFILE`: System-wide limit on open files hit.
+    /// - `ENOMEM`: Insufficient kernel memory.
     pub fn timerfd() -> Result<Self, CoreError> {
         let fd = unsafe {
             libc::timerfd_create(
@@ -87,6 +107,10 @@ impl Fd {
     }
 
     /// Perform a `dup2` syscall.
+    ///
+    /// ### Errors
+    /// - `EBADF`: The source or target file descriptor is invalid.
+    /// - `EMFILE`: The target descriptor exceeds the process limit.
     pub fn dup2(&self, target: RawFd) -> Result<(), CoreError> {
         loop {
             let r = unsafe { libc::dup2(self.0, target) };
@@ -102,6 +126,9 @@ impl Fd {
     }
 
     /// Set the `O_NONBLOCK` flag on the descriptor.
+    ///
+    /// ### Errors
+    /// - `EBADF`: The file descriptor is invalid.
     pub fn set_nonblock(&self) -> Result<(), CoreError> {
         let flags = unsafe { libc::fcntl(self.0, libc::F_GETFL) };
         syscall_ret(flags, "fcntl(F_GETFL)")?;
@@ -110,6 +137,9 @@ impl Fd {
     }
 
     /// Set the `FD_CLOEXEC` flag on the descriptor.
+    ///
+    /// ### Errors
+    /// - `EBADF`: The file descriptor is invalid.
     pub fn set_cloexec(&self) -> Result<(), CoreError> {
         let flags = unsafe { libc::fcntl(self.0, libc::F_GETFD) };
         syscall_ret(flags, "fcntl(F_GETFD)")?;
@@ -120,11 +150,25 @@ impl Fd {
     /// Read bytes into a mutable slice.
     ///
     /// Returns `Ok(None)` if the operation would block (`EAGAIN`).
+    ///
+    /// ### Edge Cases
+    /// - **Zero-length read**: Returns `Ok(Some(0))` immediately.
+    /// - **Partial read**: Returns the number of bytes actually read.
+    ///
+    /// ### Errors
+    /// - `EBADF`: The file descriptor is invalid or not open for reading.
+    /// - `EFAULT`: `buf` points outside the process's address space.
+    /// - `EIO`: Low-level I/O error.
     pub fn read_slice(&self, buf: &mut [u8]) -> Result<Option<usize>, CoreError> {
         self.read_raw(buf.as_mut_ptr(), buf.len())
     }
 
     /// Seek to an absolute file offset.
+    ///
+    /// ### Errors
+    /// - `EBADF`: The file descriptor is not seekable.
+    /// - `EINVAL`: `offset` is invalid.
+    /// - `EOVERFLOW`: The resulting offset exceeds the off_t range.
     pub fn seek_set(&self, offset: i64) -> Result<u64, CoreError> {
         loop {
             let pos = unsafe { libc::lseek(self.0, offset as libc::off_t, libc::SEEK_SET) };
@@ -142,6 +186,15 @@ impl Fd {
     /// Write bytes from a slice.
     ///
     /// Returns `Ok(None)` if the operation would block (`EAGAIN`).
+    ///
+    /// ### Edge Cases
+    /// - **Zero-length write**: Returns `Ok(Some(0))` immediately.
+    /// - **Partial write**: Returns the number of bytes actually written.
+    ///
+    /// ### Errors
+    /// - `EBADF`: The file descriptor is invalid or not open for writing.
+    /// - `EFAULT`: `buf` points outside the process's address space.
+    /// - `EPIPE`: The reading end of a pipe or socket was closed.
     pub fn write_slice(&self, buf: &[u8]) -> Result<Option<usize>, CoreError> {
         self.write_raw(buf.as_ptr(), buf.len())
     }
@@ -169,6 +222,10 @@ impl Fd {
     ///
     /// Passing `None` disarms the timer. Zero durations are rounded up to one
     /// nanosecond so the timer still expires.
+    ///
+    /// ### Errors
+    /// - `EBADF`: The file descriptor is invalid.
+    /// - `EINVAL`: The duration is invalid or not supported by the kernel.
     pub fn set_timer_oneshot(&self, delay: Option<Duration>) -> Result<(), CoreError> {
         let mut spec: libc::itimerspec = unsafe { std::mem::zeroed() };
         if let Some(delay) = delay {
@@ -264,18 +321,23 @@ impl Token {
 pub struct Event {
     /// Token associated with the ready descriptor.
     pub token: Token,
-    /// Descriptor is ready for reading.
+    /// Descriptor is ready for reading (`EPOLLIN`).
     pub readable: bool,
-    /// Descriptor has priority data or an exceptional condition (EPOLLPRI).
+    /// Descriptor has priority data or an exceptional condition (`EPOLLPRI`).
     pub priority: bool,
-    /// Descriptor is ready for writing.
+    /// Descriptor is ready for writing (`EPOLLOUT`).
     pub writable: bool,
-    /// Indicates an error or hangup (EPOLLERR | EPOLLHUP).
+    /// Indicates an error condition (`EPOLLERR`).
     ///
     /// NOTE: For edge-triggered readiness, an error condition often means both
     /// readable and writable are set to ensure the handler drains the FD.
     pub error: bool,
+    /// Indicates a remote hangup (`EPOLLHUP`).
+    pub hangup: bool,
 }
+
+const _: () = assert!(std::mem::size_of::<Event>() == 16);
+const _: () = assert!(std::mem::align_of::<Event>() == 8);
 
 /// A lightweight epoll reactor using edge-triggered monitoring (EPOLLET).
 ///
@@ -286,6 +348,12 @@ pub struct Event {
 ///
 /// Failure to drain a source will result in missing future readiness events
 /// for that file descriptor until it is re-registered or another event occurs.
+///
+/// ### Fork Safety
+/// The `Reactor` owns an `epoll` descriptor which is `O_CLOEXEC`. After an
+/// `exec` call in a child process, the reactor and all its registrations are
+/// lost. If the child continues without `exec`, it shares the same epoll
+/// instance, which is generally unsafe and requires careful coordination.
 ///
 /// # Example
 /// ```no_run
@@ -321,8 +389,10 @@ pub struct Reactor {
 impl Reactor {
     /// Create a new epoll reactor.
     ///
-    /// # Errors
-    /// Returns [`CoreError`] if `epoll_create1` fails.
+    /// ### Errors
+    /// - `EMFILE`: Process limit on open file descriptors hit.
+    /// - `ENFILE`: System-wide limit on open files hit.
+    /// - `ENOMEM`: Insufficient kernel memory.
     pub fn new() -> Result<Self, CoreError> {
         let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         syscall_ret(epfd, "epoll_create1")?;
@@ -339,8 +409,11 @@ impl Reactor {
 
     /// Initialize inotify and add it to the reactor.
     ///
-    /// # Errors
-    /// Returns [`CoreError`] if `inotify_init1` or `epoll_ctl` fails.
+    /// ### Errors
+    /// - `EMFILE`: Process limit on open file descriptors hit.
+    /// - `ENFILE`: System-wide limit on open files hit.
+    /// - `ENOMEM`: Insufficient kernel memory.
+    /// - `EPERM`: Permission denied to create inotify instance.
     pub fn setup_inotify(&mut self) -> Result<(Fd, Token), CoreError> {
         let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
         syscall_ret(fd, "inotify_init1")?;
@@ -354,11 +427,13 @@ impl Reactor {
 
     /// Initialize signalfd for SIGCHLD and add it to the reactor.
     ///
-    /// # Errors
-    /// Returns [`CoreError`] if `pthread_sigmask`, `signalfd`, or `epoll_ctl` fails.
-    ///
     /// The previous current-thread signal mask is restored when the reactor is
     /// dropped.
+    ///
+    /// ### Errors
+    /// - `EBADF`: The provided file descriptor is invalid.
+    /// - `EINVAL`: Signal mask is invalid or already set up.
+    /// - `EMFILE`: Process limit on open file descriptors hit.
     pub fn setup_signalfd(&mut self) -> Result<Token, CoreError> {
         if self.signalfd.is_some() {
             return Err(CoreError::sys(
@@ -440,6 +515,31 @@ impl Reactor {
         Ok(token)
     }
 
+    /// Register a file descriptor with custom epoll flags.
+    ///
+    /// This allows registration with flags like `EPOLLONESHOT` or explicit
+    /// control over `EPOLLET`.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use coreshift_core::reactor::{Reactor, Fd};
+    /// let mut reactor = Reactor::new().unwrap();
+    /// let fd = Fd::eventfd(0).unwrap();
+    /// reactor.add_with_flags(&fd, (libc::EPOLLIN | libc::EPOLLONESHOT) as u32).unwrap();
+    /// ```
+    #[inline(always)]
+    pub fn add_with_flags(&mut self, fd: &Fd, flags: u32) -> Result<Token, CoreError> {
+        let token = Token(self.next_token);
+        self.next_token += 1;
+        let mut ev = libc::epoll_event {
+            events: flags,
+            u64: token.0,
+        };
+        let r = unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_ADD, fd.raw(), &mut ev) };
+        syscall_ret(r, "epoll_ctl_add")?;
+        Ok(token)
+    }
+
     #[inline(always)]
     pub(crate) fn add_with_token(
         &mut self,
@@ -500,6 +600,11 @@ impl Reactor {
     /// This function blocks until at least one event is ready or the timeout
     /// expires. Ready events are appended to the `buffer`.
     ///
+    /// ### Timeout Contract
+    /// - `-1`: Block indefinitely until an event occurs or a signal interrupts.
+    /// - `0`: Return immediately, even if no events are ready.
+    /// - `> 0`: Wait for up to the specified number of milliseconds.
+    ///
     /// Returns the number of events received.
     #[inline(always)]
     pub fn wait(
@@ -542,7 +647,8 @@ impl Reactor {
                 let is_read = (ev.events & libc::EPOLLIN as u32) != 0;
                 let is_priority = (ev.events & libc::EPOLLPRI as u32) != 0;
                 let is_write = (ev.events & libc::EPOLLOUT as u32) != 0;
-                let is_err = (ev.events & (libc::EPOLLERR | libc::EPOLLHUP) as u32) != 0;
+                let is_err = (ev.events & libc::EPOLLERR as u32) != 0;
+                let is_hup = (ev.events & libc::EPOLLHUP as u32) != 0;
 
                 buffer.push(Event {
                     token: Token(ev.u64),
@@ -550,6 +656,7 @@ impl Reactor {
                     priority: is_priority || is_err,
                     writable: is_write || is_err,
                     error: is_err,
+                    hangup: is_hup,
                 });
             }
             return Ok(n as usize);

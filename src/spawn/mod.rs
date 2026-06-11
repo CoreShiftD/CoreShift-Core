@@ -422,6 +422,12 @@ fn decode_status(status: i32) -> ExitStatus {
 }
 
 /// A handle to a spawned process.
+///
+/// ### Fork Safety
+/// The process handle contains a PID. After a `fork`, the child process will
+/// have a copy of this PID, but it refers to the same original process.
+/// Calling `wait` or `kill` from the child may lead to confusing results
+/// if multiple processes are managing the same PID.
 pub struct Process {
     pid: pid_t,
 }
@@ -438,6 +444,10 @@ impl Process {
     }
 
     /// Perform a non-blocking wait for process termination.
+    ///
+    /// ### Errors
+    /// - `ECHILD`: The process does not exist or is not a child of the caller.
+    /// - `EINTR`: The call was interrupted by a signal (handled internally).
     pub fn wait_step(&self) -> Result<Option<ExitStatus>, CoreError> {
         loop {
             let mut status = 0;
@@ -457,6 +467,9 @@ impl Process {
     }
 
     /// Block until the process terminates.
+    ///
+    /// ### Errors
+    /// - `ECHILD`: The process does not exist or is not a child of the caller.
     pub fn wait_blocking(&self) -> Result<ExitStatus, CoreError> {
         loop {
             let mut status = 0;
@@ -473,6 +486,11 @@ impl Process {
     }
 
     /// Send a signal to the process.
+    ///
+    /// ### Errors
+    /// - `EINVAL`: Invalid signal number.
+    /// - `EPERM`: The caller does not have permission to send the signal.
+    /// - `ESRCH`: The process does not exist.
     pub fn kill(&self, sig: i32) -> Result<(), CoreError> {
         let r = unsafe { libc::kill(self.pid, sig) };
         if r < 0 {
@@ -486,6 +504,9 @@ impl Process {
     }
 
     /// Send a signal to the process group.
+    ///
+    /// ### Errors
+    /// Same as [`Self::kill`].
     pub fn kill_pgroup(&self, sig: i32) -> Result<(), CoreError> {
         let r = unsafe { libc::kill(-self.pid, sig) };
         if r < 0 {
@@ -741,6 +762,11 @@ use crate::io::DrainState;
 pub type SpawnDrain = DrainState<fn(&[u8]) -> bool>;
 
 /// A process that is currently running and being monitored.
+///
+/// ### Fork Safety
+/// This handle contains both a PID and owned file descriptors for process I/O.
+/// Upon `fork`, the descriptors are inherited. Standard `O_CLOEXEC` behavior
+/// applies after `exec`.
 pub struct RunningProcess {
     /// Handle to the process.
     pub process: Process,
@@ -810,8 +836,12 @@ use crate::reactor::Reactor;
 /// [`RunningProcess::into_output_parts`] to drive captured stdio without
 /// exposing internal drain state.
 ///
-/// # Errors
-/// Returns [`CoreError`] if pipe creation, process spawning, or backend selection fails.
+/// ### Errors
+/// - `EACCES`: Permission denied for the executable.
+/// - `EINVAL`: Invalid spawn options (e.g. background capture without wait).
+/// - `EMFILE`: Process limit on open file descriptors hit.
+/// - `ENOENT`: The executable was not found.
+/// - `ENOMEM`: Insufficient memory to spawn the process.
 pub fn spawn_start(opts: SpawnOptions) -> Result<RunningProcess, CoreError> {
     if !opts.wait && (opts.stdin.is_some() || opts.capture_stdout || opts.capture_stderr) {
         return Err(CoreError::sys(
@@ -838,8 +868,9 @@ pub fn spawn_start(opts: SpawnOptions) -> Result<RunningProcess, CoreError> {
 /// This is the primary high-level interface for process execution. It handles
 /// the full lifecycle, including I/O multiplexing and signal management.
 ///
-/// # Errors
-/// Returns [`CoreError`] if any underlying syscall (spawn, pipe, epoll) fails.
+/// ### Errors
+/// Returns the same errors as [`spawn_start`], plus any I/O or reactor errors
+/// encountered during the wait loop.
 pub fn spawn(opts: SpawnOptions) -> Result<Output, CoreError> {
     let wait = opts.wait;
     let timeout_ms = opts.timeout_ms;

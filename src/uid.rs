@@ -35,6 +35,15 @@ pub struct PathStat {
 /// This performs a `stat(2)` call and returns the owner UID from the resulting
 /// metadata. Missing files, permission errors, and invalid path bytes are
 /// surfaced as [`CoreError`].
+/// Return the owning UID for a filesystem path.
+///
+/// This performs a `stat(2)` call and returns the owner UID from the resulting
+/// metadata. Missing files, permission errors, and invalid path bytes are
+/// surfaced as [`CoreError`].
+///
+/// ### Errors
+/// - `EACCES`: Permission denied for a component of the path prefix.
+/// - `ENOENT`: The path does not exist.
 pub fn path_uid(path: impl AsRef<Path>) -> Result<u32, CoreError> {
     Ok(path_stat(path)?.uid)
 }
@@ -44,6 +53,9 @@ pub fn path_uid(path: impl AsRef<Path>) -> Result<u32, CoreError> {
 /// This performs a `stat(2)` call and captures the fields used by hot-path
 /// procfs callers to detect identity changes cheaply without opening procfs
 /// text files.
+///
+/// ### Errors
+/// Same as [`path_uid`].
 pub fn path_stat(path: impl AsRef<Path>) -> Result<PathStat, CoreError> {
     stat_path(path.as_ref(), "stat", true)
 }
@@ -88,6 +100,11 @@ pub fn effective_uid() -> u32 {
 }
 
 /// Change the owner of a path while leaving the group unchanged when `gid` is `None`.
+///
+/// ### Errors
+/// - `EACCES`: Permission denied for a component of the path prefix.
+/// - `EPERM`: The caller does not have permission to change the owner.
+/// - `ENOENT`: The path does not exist.
 pub fn chown_path(path: impl AsRef<Path>, uid: u32, gid: Option<u32>) -> Result<(), CoreError> {
     let path = CString::new(path.as_ref().as_os_str().as_bytes())
         .map_err(|_| CoreError::sys(libc::EINVAL, "chown"))?;

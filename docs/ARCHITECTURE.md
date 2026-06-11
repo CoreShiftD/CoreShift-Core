@@ -41,7 +41,7 @@ Future contributors must ensure Core maintains these invariants:
 - **No Policy Decisions**: Core provides primitives, not behaviors. It does not choose package allowlists, retry strategies, or product-specific defaults.
 - **No Android-specific Behavior**: Core uses Android syscalls and properties when running on Android, but it does not implement higher-level Android product logic (like foreground app detection).
 - **No Hidden Threads**: Core performs work on the caller's thread. It does not spawn background maintenance threads or global worker pools.
-- **No Global Mutable State**: Core is stateless. Configuration must be passed to primitives via options or arguments.
+- **No Global Mutable State**: Core is stateless. Configuration must be passed to primitives via options or arguments. Logging uses an immutable platform default by default; runtime backend selection requires an explicit `Logger` instance.
 - **No Capability Enforcement**: Core performs syscalls; it does not implement its own permission or capability model.
 - **No Scheduler Ownership**: Core provides reactor primitives (`epoll`) but does not include a task scheduler or executor.
 

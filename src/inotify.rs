@@ -32,29 +32,40 @@ pub struct InotifyEvent {
     pub name: Option<Vec<u8>>,
 }
 
-/// File was modified.
+/// File was modified (`IN_MODIFY`).
 pub const MODIFY_MASK: u32 = libc::IN_MODIFY;
-/// Mask for monitoring package file state changes.
+/// Mask for monitoring package file state changes (`IN_MODIFY | IN_DELETE_SELF | IN_MOVE_SELF`).
 pub const PACKAGE_FILE_MASK: u32 = libc::IN_MODIFY | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF;
 /// Mask for monitoring parent directories that may create, replace, or remove a watched file.
+/// Maps to `IN_CREATE | IN_MOVED_TO | IN_CLOSE_WRITE | IN_MODIFY | IN_DELETE_SELF | IN_MOVE_SELF`.
 pub const PARENT_WATCH_MASK: u32 = libc::IN_CREATE
     | libc::IN_MOVED_TO
     | libc::IN_CLOSE_WRITE
     | libc::IN_MODIFY
     | libc::IN_DELETE_SELF
     | libc::IN_MOVE_SELF;
-/// Inotify event queue overflowed.
+/// Inotify event queue overflowed (`IN_Q_OVERFLOW`).
 pub const QUEUE_OVERFLOW_MASK: u32 = libc::IN_Q_OVERFLOW;
-/// Watch was removed (explicitly or because file was deleted).
+/// Watch was removed (`IN_IGNORED`).
 pub const IGNORED_MASK: u32 = libc::IN_IGNORED;
-/// Filesystem containing watched object was unmounted.
+/// Filesystem containing watched object was unmounted (`IN_UNMOUNT`).
 pub const UNMOUNT_MASK: u32 = libc::IN_UNMOUNT;
-/// Watched file/directory was deleted.
+/// Watched file/directory was deleted (`IN_DELETE_SELF`).
 pub const DELETE_SELF_MASK: u32 = libc::IN_DELETE_SELF;
-/// Watched file/directory was moved.
+/// Watched file/directory was moved (`IN_MOVE_SELF`).
 pub const MOVE_SELF_MASK: u32 = libc::IN_MOVE_SELF;
 
 /// Create a non-blocking close-on-exec inotify file descriptor.
+///
+/// The descriptor is created with `IN_CLOEXEC` and `IN_NONBLOCK` set.
+///
+/// ### Fork Safety
+/// The descriptor is `O_CLOEXEC` and will be closed in the child after `exec`.
+///
+/// ### Errors
+/// - `EMFILE`: Process limit on open file descriptors hit.
+/// - `ENFILE`: System-wide limit on open files hit.
+/// - `ENOMEM`: Insufficient kernel memory.
 pub fn init() -> Result<Fd, CoreError> {
     let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
     syscall_ret(fd, "inotify_init1")?;
@@ -68,8 +79,13 @@ pub fn init() -> Result<Fd, CoreError> {
 /// * `path` - Path to the file or directory to watch.
 /// * `mask` - Events to monitor (e.g., [`MODIFY_MASK`]).
 ///
-/// # Errors
-/// Returns [`CoreError`] if `inotify_add_watch` fails or if the path contains a NUL byte.
+/// ### Errors
+/// - `EACCES`: Read access to the path is denied.
+/// - `EBADF`: The provided file descriptor is invalid.
+/// - `EINVAL`: The mask contains invalid bits or the path is invalid.
+/// - `ENOENT`: A component of the path does not exist.
+/// - `ENOSPC`: The user limit on the total number of inotify watches was reached.
+/// - `ENOMEM`: Insufficient kernel memory.
 pub fn add_watch(fd: &Fd, path: &str, mask: u32) -> Result<i32, CoreError> {
     let path = std::ffi::CString::new(path)
         .map_err(|_| CoreError::sys(libc::EINVAL, "inotify path contains nul"))?;
@@ -84,6 +100,10 @@ pub fn add_watch(fd: &Fd, path: &str, mask: u32) -> Result<i32, CoreError> {
 }
 
 /// Remove an existing watch descriptor from an inotify instance.
+///
+/// ### Errors
+/// - `EBADF`: The provided file descriptor is invalid.
+/// - `EINVAL`: The watch descriptor `wd` is invalid for this inotify instance.
 pub fn remove_watch(fd: &Fd, wd: i32) -> Result<(), CoreError> {
     #[cfg(target_os = "android")]
     let raw_wd = u32::try_from(wd).map_err(|_| CoreError::sys(libc::EINVAL, "inotify_rm_watch"))?;
@@ -100,8 +120,17 @@ pub fn remove_watch(fd: &Fd, wd: i32) -> Result<(), CoreError> {
 /// This function drains the inotify file descriptor until no more events
 /// are available (`EAGAIN`). It is safe to use with edge-triggered reactors.
 ///
-/// # Errors
-/// Returns [`CoreError`] if a `read` syscall fails (excluding `EAGAIN`/`EWOULDBLOCK`).
+/// ### Edge Cases
+/// - **Zero-length read**: If the descriptor is non-blocking and no data is
+///   ready, this returns `Ok(Vec::new())` (via `EAGAIN` mapping).
+/// - **Partial read**: This function ensures that only complete event
+///   structures are decoded from the buffer.
+///
+/// ### Errors
+/// - `EBADF`: The provided file descriptor is invalid.
+/// - `EFAULT`: The internal buffer points outside the process's address space.
+/// - `EINVAL`: Internal buffer is too small for even one event (should not happen).
+/// - `EIO`: Low-level I/O error.
 pub fn read_events(fd: &Fd) -> Result<Vec<InotifyEvent>, CoreError> {
     let mut all_events = Vec::new();
     let mut buf = vec![0u8; 4096];

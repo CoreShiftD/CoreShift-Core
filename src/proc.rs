@@ -22,11 +22,20 @@ pub struct ProcStatus {
 
 /// Read process status from `/proc/<pid>/status`.
 ///
+/// Read process status from `/proc/<pid>/status`.
+///
+/// ### Errors
+/// - `EACCES`: Permission denied.
+/// - `ENOENT`: The process does not exist.
 pub fn read_proc_status(pid: i32) -> Result<ProcStatus, CoreError> {
     read_proc_status_at("/proc", pid)
 }
 
 /// Read process status from an explicit procfs root.
+///
+/// ### Errors
+/// - `EACCES`: Permission denied.
+/// - `ENOENT`: The process or status file does not exist.
 pub fn read_proc_status_at(proc_root: impl AsRef<Path>, pid: i32) -> Result<ProcStatus, CoreError> {
     let path = proc_root.as_ref().join(pid.to_string()).join("status");
     let content = std::fs::read_to_string(path).map_err(|err| io_error(err, "read_proc_status"))?;
@@ -37,6 +46,14 @@ pub fn read_proc_status_at(proc_root: impl AsRef<Path>, pid: i32) -> Result<Proc
 ///
 /// NUL separators are converted into spaces so the returned string is easier
 /// to log or inspect.
+/// Read process command line from `/proc/<pid>/cmdline`.
+///
+/// NUL separators are converted into spaces so the returned string is easier
+/// to log or inspect.
+///
+/// ### Errors
+/// - `EACCES`: Permission denied.
+/// - `ENOENT`: The process does not exist.
 pub fn read_proc_cmdline(pid: i32) -> Result<String, CoreError> {
     read_proc_cmdline_at("/proc", pid)
 }
@@ -45,6 +62,10 @@ pub fn read_proc_cmdline(pid: i32) -> Result<String, CoreError> {
 ///
 /// This is useful for tests, alternate proc mounts, or callers that need the
 /// same parsing behavior without being hard-wired to `/proc`.
+///
+/// ### Errors
+/// - `EACCES`: Permission denied.
+/// - `ENOENT`: The process or cmdline file does not exist.
 pub fn read_proc_cmdline_at(proc_root: impl AsRef<Path>, pid: i32) -> Result<String, CoreError> {
     let path = proc_root.as_ref().join(pid.to_string()).join("cmdline");
     let bytes = std::fs::read(path).map_err(|err| io_error(err, "read_proc_cmdline"))?;
@@ -88,6 +109,9 @@ fn io_error(err: std::io::Error, op: &'static str) -> CoreError {
 }
 
 /// Return the number of clock ticks per second for the current system.
+///
+/// ### Errors
+/// - `EINVAL`: `sysconf` failed to retrieve the clock tick rate.
 #[inline(always)]
 pub fn clock_ticks_per_second() -> Result<u64, CoreError> {
     let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };

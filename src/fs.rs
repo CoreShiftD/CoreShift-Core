@@ -19,6 +19,11 @@ pub struct PathFingerprint {
     pub modified_ns: u128,
 }
 
+/// Return a fingerprint of the file metadata at the specified path.
+///
+/// ### Errors
+/// - `EACCES`: Permission denied.
+/// - `ENOENT`: The path does not exist.
 pub fn path_fingerprint(path: &Path) -> Result<PathFingerprint, CoreError> {
     let metadata = std::fs::metadata(path).map_err(|err| {
         CoreError::sys(err.raw_os_error().unwrap_or(libc::EIO), "path_fingerprint")
@@ -65,6 +70,12 @@ pub fn path_lstat_exists(path: &str) -> bool {
 ///
 /// This stays as a small convenience helper for low-level modules that treat
 /// blocking filesystem or procfs reads as an acceptable boundary cost.
+/// Read the entire contents of a file into a string.
+///
+/// ### Errors
+/// - `EACCES`: Permission denied.
+/// - `ENOENT`: The path does not exist.
+/// - `EIO`: Low-level I/O error.
 pub fn read_to_string(path: &str) -> Result<String, CoreError> {
     std::fs::read_to_string(path)
         .map_err(|err| CoreError::sys(err.raw_os_error().unwrap_or(libc::EIO), "read_to_string"))
@@ -79,6 +90,11 @@ pub fn read_to_string(path: &str) -> Result<String, CoreError> {
 /// The `offset` and `len` identify the byte range to prefetch for `fd`.
 /// Success means the kernel accepted the request, not that subsequent reads
 /// are guaranteed to be cache hits.
+/// Advise the kernel to begin reading file data into the page cache.
+///
+/// ### Errors
+/// - `EBADF`: The file descriptor is invalid.
+/// - `EINVAL`: The offset or length is invalid.
 pub fn readahead(fd: impl AsRawFd, offset: u64, len: usize) -> Result<(), CoreError> {
     readahead_raw(fd.as_raw_fd(), offset, len)
 }
@@ -87,6 +103,12 @@ pub fn readahead(fd: impl AsRawFd, offset: u64, len: usize) -> Result<(), CoreEr
 ///
 /// `offset` must be page-aligned. This low-level primitive rejects unaligned
 /// offsets with `EINVAL` instead of silently widening the requested range.
+/// Map a file range and advise the kernel with `MADV_WILLNEED`.
+///
+/// ### Errors
+/// - `EBADF`: The file descriptor is invalid.
+/// - `EINVAL`: The offset is not page-aligned or the range is invalid.
+/// - `ENOMEM`: Insufficient kernel memory.
 pub fn mmap_madvise(
     fd: impl AsRawFd,
     offset: u64,

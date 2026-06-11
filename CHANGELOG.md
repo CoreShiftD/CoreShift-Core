@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-05-12
+
+### Added
+
+- **Reactor**: Exposed `add_with_flags` for custom epoll registration.
+- **Unix Sockets**: Added `accept_timeout` for millisecond-based timeouts.
+- **Unix Sockets**: Added `peer_cred` support for retrieving peer process identity.
+- **Signals**: Added `register_handler` for arbitrary process-wide signal handlers.
+- **Signals**: Added `signalfd_new` for reactor-compatible signal reception.
+
+## [1.0.0] - 2026-05-12
+
+### Added
+
+- **Logging**: Refactored to a backend-agnostic facade with `Logger` instances.
+- **Reactor**: Added `hangup` field to `Event`.
+- **Documentation**: Comprehensive behavioral contract and architectural invariant documentation.
+
+### Changed
+
+- **Spawn**: `SpawnBackend` is now mandatory at builder construction.
+- **Layering**: Renamed `blocklist_fingerprint` to `path_fingerprint`.
+
+### Stability Contract
+
+The 1.x series guarantees stability for the following behavioral contracts. Changes to these are considered **breaking changes**:
+
+- **Reactor Events**: The mapping of epoll flags to `Event` fields (`EPOLLERR` -> `error`, `EPOLLHUP` -> `hangup`).
+- **Reactor Timeouts**: The `-1`/`0`/`positive` millisecond contract in `Reactor::wait`.
+- **Descriptor Defaults**: The use of `O_CLOEXEC` / `SOCK_CLOEXEC` for all Core-created descriptors.
+- **Signal Compatibility**: The requirement to use `signalfd` (via `signalfd_new`) for reactor-compatible signal handling.
+- **Policy Neutrality**: The architectural commitment to provide primitives without policy.
+
 ## [0.3.0] - 2026-05-11
 
 ### Added

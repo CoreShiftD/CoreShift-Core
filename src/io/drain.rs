@@ -68,6 +68,9 @@ where
     /// Initialize a new drain state for the provided descriptors.
     ///
     /// This consumes the descriptors and sets them to non-blocking mode.
+    ///
+    /// ### Errors
+    /// - `EBADF`: One of the provided file descriptors is invalid.
     pub fn new(
         stdin_fd: Option<Fd>,
         stdin_buf: Option<Box<[u8]>>,
@@ -118,6 +121,13 @@ where
     }
 
     /// Perform a non-blocking write to stdin if pending.
+    ///
+    /// Returns `Ok(true)` if the write buffer is empty or the descriptor is
+    /// closed.
+    ///
+    /// ### Errors
+    /// - `EPIPE`: The child process closed its reading end of the pipe.
+    /// - `EIO`: Low-level I/O error.
     #[inline(always)]
     pub fn write_stdin(&mut self) -> Result<bool, CoreError> {
         let fd = if let Some(s) = &self.stdin_slot {
@@ -135,6 +145,13 @@ where
     }
 
     /// Perform a non-blocking read from stdout or stderr.
+    ///
+    /// Returns `Ok(true)` if the stream reached EOF or the early-exit condition
+    /// was met.
+    ///
+    /// ### Errors
+    /// - `EOVERFLOW`: The captured output exceeded the specified limit.
+    /// - `EIO`: Low-level I/O error.
     #[inline(always)]
     pub fn read_fd(&mut self, is_stdout: bool) -> Result<bool, CoreError> {
         let read_state = {

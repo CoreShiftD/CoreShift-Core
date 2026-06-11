@@ -41,7 +41,7 @@ pub enum LogBackend {
 /// a non-default logging backend must create a [`Logger`] instance and use
 /// it directly.
 ///
-/// By default, macros like [`alog_info!`] use a platform-appropriate default
+/// By default, macros like `alog_info!` use a platform-appropriate default
 /// logger ([`LogBackend::Android`] on Android, [`LogBackend::Stderr`] otherwise).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Logger {

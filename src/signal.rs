@@ -10,6 +10,7 @@
 
 use crate::CoreError;
 use crate::error::syscall_ret;
+use crate::reactor::Fd;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 pub type SignalSet = libc::sigset_t;
@@ -19,6 +20,8 @@ pub const SIGINT: i32 = libc::SIGINT;
 pub const SIGTERM: i32 = libc::SIGTERM;
 pub const SIGPIPE: i32 = libc::SIGPIPE;
 pub const SIGKILL: i32 = libc::SIGKILL;
+pub const SIGUSR1: i32 = libc::SIGUSR1;
+pub const SIGUSR2: i32 = libc::SIGUSR2;
 
 static SHUTDOWN_FLAG_PTR: AtomicPtr<AtomicBool> = AtomicPtr::new(std::ptr::null_mut());
 
@@ -38,11 +41,30 @@ extern "C" fn shutdown_signal_handler(_sig: libc::c_int) {
 /// process-global and remain installed until replaced by another install.
 /// Use [`install_shutdown_flag_guard`] when the previous process-global
 /// handlers must be restored automatically.
+///
+/// ### Reactor Compatibility
+/// This function uses standard Unix `signal()`/`sigaction()` handlers and is
+/// **not** directly compatible with the `Reactor`. For event-loop based
+/// applications, prefer using [`SignalRuntime::signalfd_new`].
+///
+/// ### Fork Safety
+/// Signal handlers are inherited by the child. The shutdown flag pointer is
+/// also inherited. If the child process receives SIGINT/SIGTERM, it will
+/// attempt to flip the flag in its own address space at the same virtual
+/// address.
+///
+/// ### Errors
+/// - `EINVAL`: Invalid signal number.
 pub fn install_shutdown_flag(flag: &'static AtomicBool) -> Result<(), CoreError> {
     install_shutdown_flag_inner(flag).map(|_| ())
 }
 
 /// Guard that restores previous SIGINT/SIGTERM handlers and shutdown flag on drop.
+///
+/// ### Fork Safety
+/// The guard is owned by the process that created it. If the process forks,
+/// the child will also have a copy of the guard, but dropping it in the child
+/// will restore handlers in the child's context only.
 pub struct ShutdownFlagGuard {
     old_sigint: libc::sigaction,
     old_sigterm: libc::sigaction,
@@ -145,6 +167,9 @@ impl SignalRuntime {
     }
 
     /// Create a signal set containing the specified signals.
+    ///
+    /// ### Errors
+    /// - `EINVAL`: One of the signal numbers is invalid.
     pub fn set_with(signals: &[i32]) -> Result<SignalSet, CoreError> {
         let mut set: SignalSet = unsafe { std::mem::zeroed() };
         unsafe { libc::sigemptyset(&mut set) };
@@ -158,6 +183,9 @@ impl SignalRuntime {
     }
 
     /// Block the specified signals for the current thread and return the previous mask.
+    ///
+    /// ### Errors
+    /// - `EINVAL`: `how` or `signals` is invalid.
     pub fn block_current_thread(signals: &SignalSet) -> Result<SignalSet, CoreError> {
         let mut previous = Self::empty_set();
         let result = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, signals, &mut previous) };
@@ -169,6 +197,9 @@ impl SignalRuntime {
     }
 
     /// Restore the current thread signal mask.
+    ///
+    /// ### Errors
+    /// - `EINVAL`: `mask` is invalid.
     pub fn restore_current_thread(mask: &SignalSet) -> Result<(), CoreError> {
         let result =
             unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, mask, std::ptr::null_mut()) };
@@ -180,6 +211,9 @@ impl SignalRuntime {
     }
 
     /// Wait synchronously for one of the supplied signals.
+    ///
+    /// ### Errors
+    /// - `EINVAL`: `signals` contains invalid signal numbers.
     pub fn wait(signals: &SignalSet) -> Result<i32, CoreError> {
         let mut received_signal = 0;
         let result = unsafe { libc::sigwait(signals, &mut received_signal) };
@@ -191,12 +225,36 @@ impl SignalRuntime {
     }
 
     /// Deliver a signal to a specific thread.
+    ///
+    /// ### Errors
+    /// - `EINVAL`: Invalid signal number.
+    /// - `ESRCH`: The thread ID is invalid or the thread has terminated.
     pub fn interrupt_thread(thread: ThreadId, signal: i32) -> Result<(), CoreError> {
         let result = unsafe { libc::pthread_kill(thread, signal) };
         if result == 0 {
             Ok(())
         } else {
             Err(CoreError::sys(result, "pthread_kill"))
+        }
+    }
+
+    /// Block or unblock signals for the current thread and return the previous mask.
+    pub fn set_current_thread_mask(
+        how: i32,
+        signals: &SignalSet,
+    ) -> Result<SignalSet, CoreError> {
+        let mut previous = Self::empty_set();
+        let result = unsafe { libc::pthread_sigmask(how, signals, &mut previous) };
+        if result == 0 {
+            Ok(previous)
+        } else {
+            let op = match how {
+                libc::SIG_BLOCK => "pthread_sigmask(SIG_BLOCK)",
+                libc::SIG_UNBLOCK => "pthread_sigmask(SIG_UNBLOCK)",
+                libc::SIG_SETMASK => "pthread_sigmask(SIG_SETMASK)",
+                _ => "pthread_sigmask",
+            };
+            Err(CoreError::sys(result, op))
         }
     }
 
@@ -207,7 +265,64 @@ impl SignalRuntime {
         syscall_ret(r, "sigprocmask")
     }
 
+    /// Create a new `signalfd` for the specified signal set.
+    ///
+    /// The descriptor is created with `SFD_CLOEXEC` and `SFD_NONBLOCK` set.
+    /// Callers are responsible for blocking the signals in the set before
+    /// reading from the `signalfd`.
+    ///
+    /// ### Fork Safety
+    /// The descriptor is `O_CLOEXEC` and will be closed in the child after `exec`.
+    ///
+    /// ### Errors
+    /// - `EINVAL`: `signals` is invalid.
+    /// - `EMFILE`: Process limit on open file descriptors hit.
+    /// - `ENFILE`: System-wide limit on open files hit.
+    pub fn signalfd_new(signals: &SignalSet) -> Result<Fd, CoreError> {
+        let fd = unsafe { libc::signalfd(-1, signals, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC) };
+        syscall_ret(fd, "signalfd")?;
+        Fd::new(fd, "signalfd")
+    }
+
+    /// Register a process-wide handler for a single signal.
+    ///
+    /// This is a low-level wrapper around `sigaction(2)`.
+    ///
+    /// ### Fork Safety
+    /// Signal handlers are inherited across `fork`.
+    ///
+    /// ### Errors
+    /// - `EINVAL`: Invalid signal number.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use coreshift_core::signal::{SignalRuntime, SIGUSR1};
+    /// extern "C" fn handler(_: i32) {}
+    /// SignalRuntime::register_handler(SIGUSR1, handler).unwrap();
+    /// ```
+    pub fn register_handler(
+        sig: i32,
+        handler: extern "C" fn(i32),
+    ) -> Result<libc::sigaction, CoreError> {
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        let mut old_action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = handler as *const () as usize;
+        action.sa_flags = 0;
+        unsafe { libc::sigemptyset(&mut action.sa_mask) };
+
+        let ret = unsafe { libc::sigaction(sig, &action, &mut old_action) };
+        if ret == -1 {
+            let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            Err(CoreError::sys(code, "sigaction"))
+        } else {
+            Ok(old_action)
+        }
+    }
+
     /// Reset a signal to its default kernel handler.
+    ///
+    /// ### Errors
+    /// - `EINVAL`: Invalid signal number.
     pub fn reset_default(sig: i32) -> Result<(), CoreError> {
         let prev = unsafe { libc::signal(sig, libc::SIG_DFL) };
         if prev == libc::SIG_ERR {

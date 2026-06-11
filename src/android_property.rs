@@ -44,6 +44,11 @@ pub fn android_property_get(key: &str) -> Option<String> {
     SystemAndroidPropertyStore.get(key)
 }
 
+/// Set an Android system property.
+///
+/// ### Errors
+/// - `EINVAL`: Key or value contains a NUL byte or exceeds the length limit.
+/// - `EACCES`: Permission denied.
 pub fn android_property_set(key: &str, value: &str) -> io::Result<()> {
     SystemAndroidPropertyStore.set(key, value)
 }
@@ -52,14 +57,26 @@ pub fn android_property_find(key: &str) -> Option<AndroidPropertyInfo> {
     system_android_property_find(key)
 }
 
+/// Read the current value of an Android system property.
+///
+/// ### Errors
+/// - `EINVAL`: The property info is invalid.
 pub fn android_property_read(property: AndroidPropertyInfo) -> io::Result<AndroidPropertyValue> {
     system_android_property_read(property)
 }
 
+/// Return the current serial number of an Android system property.
+///
+/// ### Errors
+/// - `EINVAL`: The property info is invalid.
 pub fn android_property_serial(property: AndroidPropertyInfo) -> io::Result<u32> {
     system_android_property_serial(property)
 }
 
+/// Wait for an Android system property to change from its last known serial.
+///
+/// ### Errors
+/// - `EINVAL`: The property info or timeout is invalid.
 pub fn android_property_wait(
     property: AndroidPropertyInfo,
     old_serial: u32,
