@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.2] - 2026-05-12
+
+### Fixed
+
+- **Spawn**: Removed a 1ms busy-wait loop that occurred after child process termination while waiting for final I/O drainage.
+- **Signals**: Corrected `SignalRuntime::unblock_all` to use `pthread_sigmask` for thread-safe consistency.
+- **Documentation**: Resolved duplicated documentation headers in the `unix_socket` module.
+
 ## [1.1.1] - 2026-05-12
 
 ### Fixed

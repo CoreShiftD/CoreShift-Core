@@ -233,7 +233,6 @@ impl UnixStreamFd {
     }
 }
 
-/// Bind and listen on a non-blocking Unix stream socket.
 /// Bind a new Unix domain stream listener.
 ///
 /// The socket is created with `SOCK_CLOEXEC` set.

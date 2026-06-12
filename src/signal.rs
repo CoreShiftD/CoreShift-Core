@@ -261,8 +261,12 @@ impl SignalRuntime {
     /// Unblock all signals for the current thread.
     pub fn unblock_all() -> Result<(), CoreError> {
         let empty_mask = Self::empty_set();
-        let r = unsafe { libc::sigprocmask(libc::SIG_SETMASK, &empty_mask, std::ptr::null_mut()) };
-        syscall_ret(r, "sigprocmask")
+        let r = unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &empty_mask, std::ptr::null_mut()) };
+        if r != 0 {
+            Err(CoreError::sys(r, "pthread_sigmask(SIG_SETMASK)"))
+        } else {
+            Ok(())
+        }
     }
 
     /// Create a new `signalfd` for the specified signal set.
@@ -278,6 +282,14 @@ impl SignalRuntime {
     /// - `EINVAL`: `signals` is invalid.
     /// - `EMFILE`: Process limit on open file descriptors hit.
     /// - `ENFILE`: System-wide limit on open files hit.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use coreshift_core::signal::{SignalRuntime, SIGUSR1};
+    /// let signals = SignalRuntime::set_with(&[SIGUSR1]).unwrap();
+    /// SignalRuntime::block_current_thread(&signals).unwrap();
+    /// let sfd = SignalRuntime::signalfd_new(&signals).unwrap();
+    /// ```
     pub fn signalfd_new(signals: &SignalSet) -> Result<Fd, CoreError> {
         let fd = unsafe { libc::signalfd(-1, signals, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC) };
         syscall_ret(fd, "signalfd")?;

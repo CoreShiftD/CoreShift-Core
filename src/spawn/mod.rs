@@ -1473,15 +1473,7 @@ fn wait_loop(
             });
         }
 
-        let timeout = if status_raw.is_some() {
-            if poll_timeout == -1 || poll_timeout > 1 {
-                1
-            } else {
-                poll_timeout
-            }
-        } else {
-            poll_timeout
-        };
+        let timeout = poll_timeout;
 
         let mut events = Vec::new();
         let nevents = reactor.wait(&mut events, 64, timeout)?;
