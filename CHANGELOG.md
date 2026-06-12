@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-05-12
+
+### Fixed
+
+- **Reactor**: Fixed a bug where `EPOLLERR` events were not folded into `readable`/`writable` flags, potentially causing hangs in callers that do not explicitly check `error`.
+- **Spawn**: Fixed a potential hang in the process wait loop by explicitly handling `EPOLLHUP` (hangup) events.
+- **Documentation**: Cleaned up redundant lines in `proc` module documentation.
+
 ## [1.1.0] - 2026-05-12
 
 ### Added

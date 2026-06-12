@@ -794,13 +794,13 @@ impl RunningProcess {
         event: &crate::reactor::Event,
     ) -> Result<(), CoreError> {
         if self.drain.stdout_matches(event.token) {
-            if event.readable {
+            if event.readable || event.hangup {
                 self.drain.handle_stdout_ready(reactor)?;
             } else if event.error {
                 self.drain.drop_stdout(reactor)?;
             }
         } else if self.drain.stderr_matches(event.token) {
-            if event.readable {
+            if event.readable || event.hangup {
                 self.drain.handle_stderr_ready(reactor)?;
             } else if event.error {
                 self.drain.drop_stderr(reactor)?;
@@ -808,7 +808,7 @@ impl RunningProcess {
         } else if self.drain.stdin_matches(event.token) {
             if event.writable {
                 self.drain.handle_stdin_writable(reactor)?;
-            } else if event.error {
+            } else if event.error || event.hangup {
                 self.drain.drop_stdin(reactor)?;
             }
         }
@@ -1488,13 +1488,13 @@ fn wait_loop(
 
         for ev in events.iter().take(nevents) {
             if drain.stdout_matches(ev.token) {
-                if ev.readable {
+                if ev.readable || ev.hangup {
                     drain.handle_stdout_ready(&mut reactor)?;
                 } else if ev.error {
                     drain.drop_stdout(&mut reactor)?;
                 }
             } else if drain.stderr_matches(ev.token) {
-                if ev.readable {
+                if ev.readable || ev.hangup {
                     drain.handle_stderr_ready(&mut reactor)?;
                 } else if ev.error {
                     drain.drop_stderr(&mut reactor)?;
@@ -1502,7 +1502,7 @@ fn wait_loop(
             } else if drain.stdin_matches(ev.token) {
                 if ev.writable {
                     drain.handle_stdin_writable(&mut reactor)?;
-                } else if ev.error {
+                } else if ev.error || ev.hangup {
                     drain.drop_stdin(&mut reactor)?;
                 }
             }

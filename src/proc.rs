@@ -22,8 +22,6 @@ pub struct ProcStatus {
 
 /// Read process status from `/proc/<pid>/status`.
 ///
-/// Read process status from `/proc/<pid>/status`.
-///
 /// ### Errors
 /// - `EACCES`: Permission denied.
 /// - `ENOENT`: The process does not exist.
@@ -42,10 +40,6 @@ pub fn read_proc_status_at(proc_root: impl AsRef<Path>, pid: i32) -> Result<Proc
     parse_proc_status(&content)
 }
 
-/// Read process command line from `/proc/<pid>/cmdline`.
-///
-/// NUL separators are converted into spaces so the returned string is easier
-/// to log or inspect.
 /// Read process command line from `/proc/<pid>/cmdline`.
 ///
 /// NUL separators are converted into spaces so the returned string is easier
