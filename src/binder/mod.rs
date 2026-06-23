@@ -149,7 +149,11 @@ mod imp {
     unsafe impl Send for DlHandle {}
     impl Drop for DlHandle {
         fn drop(&mut self) {
-            if !self.0.is_null() { unsafe { libc::dlclose(self.0) }; }
+            // Intentionally no dlclose: the binder thread pool spawned in
+            // open_with_observer() keeps executing library code until process
+            // exit. Unloading the library while that thread runs causes
+            // use-after-free. libbinder_ndk.so is never unloaded during the
+            // daemon lifetime; the OS reclaims it on exit.
         }
     }
 
