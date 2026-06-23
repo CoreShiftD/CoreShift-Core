@@ -25,6 +25,7 @@
 //!
 //! Public primitive modules:
 //! - [`crate::android_property`] for direct Android system property access
+//! - [`crate::binder`] for NDK binder service queries (Android only)
 //! - [`crate::fs`] for filesystem probes and readahead
 //! - [`crate::proc`] for procfs helpers
 //! - [`crate::signal`] for signal and shutdown helpers
@@ -44,6 +45,7 @@
 //! ```
 
 pub mod android_property;
+pub mod binder;
 pub mod error;
 pub mod fs;
 pub mod inotify;

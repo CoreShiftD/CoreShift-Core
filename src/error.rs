@@ -21,6 +21,13 @@ pub enum CoreError {
         /// The name of the failed operation.
         op: &'static str,
     },
+    /// An NDK binder operation failed with the specified status code.
+    Binder {
+        /// The NDK binder status code (`binder_status_t`).
+        code: i32,
+        /// The name of the failed operation.
+        op: &'static str,
+    },
 }
 
 impl CoreError {
@@ -29,10 +36,16 @@ impl CoreError {
         Self::Syscall { code, op }
     }
 
+    /// Construct a new binder error.
+    pub fn binder(code: i32, op: &'static str) -> Self {
+        Self::Binder { code, op }
+    }
+
     /// Return the raw OS error code if applicable.
     pub fn raw_os_error(&self) -> Option<i32> {
         match self {
             Self::Syscall { code, .. } => Some(*code),
+            Self::Binder { .. } => None,
         }
     }
 
@@ -46,6 +59,7 @@ impl fmt::Display for CoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Syscall { code, op } => write!(f, "{op} failed (code={code})"),
+            Self::Binder { code, op } => write!(f, "binder {op} failed (status={code})"),
         }
     }
 }

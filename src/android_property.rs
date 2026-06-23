@@ -101,6 +101,7 @@ fn validate_property_c_string(value: &str) -> io::Result<CString> {
     CString::new(value).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "embedded NUL"))
 }
 
+#[cfg(not(target_os = "android"))]
 fn android_properties_unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,

@@ -48,8 +48,14 @@ impl WriterState {
                         return Ok(false); // Would block
                     }
                     Err(e) => {
-                        let CoreError::Syscall { code, .. } = &e;
-                        if *code == libc::EPIPE {
+                        let code = match &e {
+                            CoreError::Syscall { code, .. } => *code,
+                            _ => {
+                                self.buf = None;
+                                return Err(e);
+                            }
+                        };
+                        if code == libc::EPIPE {
                             self.buf = None;
                             return Ok(true); // Broken pipe (treat as end of write stream)
                         } else {
