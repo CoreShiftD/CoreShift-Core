@@ -387,15 +387,27 @@ mod imp {
 
             let api = sdk_version().unwrap_or(30);
 
-            if let Some(pair) = table_lookup(api) {
+            let pair = if let Some(pair) = table_lookup(api) {
                 if Self::tx_code_valid(vt, service, pair.0) {
-                    return Ok(pair);
+                    pair
+                } else {
+                    probe_window(api)
+                        .find(|&(code, _)| Self::tx_code_valid(vt, service, code))
+                        .ok_or_else(|| CoreError::binder(-1, "tx_code_resolution"))?
                 }
-            }
+            } else {
+                probe_window(api)
+                    .find(|&(code, _)| Self::tx_code_valid(vt, service, code))
+                    .ok_or_else(|| CoreError::binder(-1, "tx_code_resolution"))?
+            };
 
-            probe_window(api)
-                .find(|&(code, _)| Self::tx_code_valid(vt, service, code))
-                .ok_or_else(|| CoreError::binder(-1, "tx_code_resolution"))
+            // Persist so future daemon restarts skip probe entirely.
+            // Format: observer_code focused_task_code api_mode fg_code
+            // We only own focused_task_code; write 0 for fields fgw manages.
+            let api_mode = if pair.1 { 2i32 } else { 1i32 };
+            let _ = std::fs::write(TX_CACHE_PATH, format!("0 {} {} 0\n", pair.0, api_mode));
+
+            Ok(pair)
         }
 
         fn tx_code_valid(vt: &Vtable, service: *mut AIBinder, code: i32) -> bool {
