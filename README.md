@@ -8,13 +8,54 @@ Policy / product behavior
         ↓
 Engine coordination
         ↓
-Core syscall and filesystem primitives
+Core syscall and filesystem primitives  ← this crate
 ```
 
 Core exposes explicit wrappers for process spawning, file descriptor handling,
 procfs parsing, signals, reactor primitives, inotify, Unix sockets, and
 filesystem preload helpers. It does not choose Android policy, foreground app
 behavior, package discovery, daemon protocols, or preload rules.
+
+## Modules
+
+| Module | Description |
+|--------|-------------|
+| `android_property` | Direct `__system_property_get` access |
+| `binder` | NDK binder client + `IProcessObserver` server via `dlopen`; resolves `IActivityManager` transaction codes from DEX at runtime |
+| `dex` | Minimal ZIP + DEX parser; reads `TRANSACTION_*` static int fields from `framework.jar` without subprocesses |
+| `error` | `CoreError` and errno constants |
+| `fs` | Filesystem probes and readahead |
+| `inotify` | Watch setup and event decode |
+| `io` | Explicit drain helpers |
+| `proc` | procfs helpers (`/proc/<pid>/cmdline`, `oom_score_adj`, etc.) |
+| `process` | `fork`, `setsid`, `setpgid`, `redirect_fd_to`, `setresuid/gid` |
+| `reactor` | `epoll`-based fd readiness (`Reactor`, `Token`, `Fd`) |
+| `signal` | Signal masking, `signalfd`, `signal_ignore` |
+| `spawn` | Explicit process spawning and wait |
+| `uid` | UID → package ownership (`/proc/<pid>/status`) |
+| `unix_socket` | Abstract Unix domain socket bind/connect/accept |
+
+## Binder observer
+
+`ActivityManagerBinder::open_with_observer(cache_path)` registers the calling
+process as an `IProcessObserver` with Android's ActivityManager and returns a
+raw `eventfd` that becomes readable whenever `onForegroundActivitiesChanged`
+fires. Callers add the fd to their epoll reactor and call
+`get_focused_package()` on the event. Transaction codes are resolved in order:
+
+1. `tx_code.txt` cache (written by this crate or compatible tools)
+2. Parse `framework.jar` DEX — `TRANSACTION_*` static fields in
+   `IActivityManager$Stub` and `IProcessObserver$Stub`
+
+The binder observer technique is based on the approach by
+**[sehan64](https://github.com/sehan64)**.
+
+## Release Dependency
+
+```toml
+[dependencies]
+coreshift-core = "1.2.8"
+```
 
 ## Documentation
 
@@ -23,13 +64,6 @@ behavior, package discovery, daemon protocols, or preload rules.
 - [Signal Handling](docs/SIGNAL_HANDLING.md)
 - [Preload primitives](docs/PRELOAD_PRIMITIVES.md)
 - [Testing](docs/TESTING.md)
-
-## Release Dependency
-
-```toml
-[dependencies]
-coreshift-core = "1.0.0"
-```
 
 ## License
 
