@@ -45,6 +45,7 @@
 //! ```
 
 pub mod android_property;
+pub mod dex;
 pub mod binder;
 pub mod error;
 pub mod fs;

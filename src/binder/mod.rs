@@ -7,17 +7,20 @@
 //! Uses `dlopen` on `libbinder_ndk.so` to avoid hard-linking against a library
 //! absent from older NDK toolchains or non-Android targets.
 //!
-//! All public types are gated on `#[cfg(target_os = "android")]`. On other
-//! targets every entry point returns `CoreError::Binder`.
-//!
 //! ## Transaction code resolution
 //!
-//! `IActivityManager` transaction codes are AIDL-generated and shift with each
-//! AOSP release. Resolution order (no subprocess required):
+//! Resolution order (no subprocess required):
 //!
-//! 1. Parse `/data/local/tmp/coreshift/tx_code.txt` if present (written by fgw).
-//! 2. Look up a known code from the `ro.build.version.sdk` property table.
-//! 3. Linear probe codes in a narrow SDK-version-dependent window.
+//! 1. `tx_code.txt` cache (written by fgw or a previous run).
+//! 2. Parse `framework.jar` DEX — reads `TRANSACTION_*` static int fields
+//!    from `IActivityManager$Stub` and `IProcessObserver$Stub` directly.
+//!
+//! ## Observer mode
+//!
+//! `ActivityManagerBinder::open_with_observer` registers this process as an
+//! `IProcessObserver` with ActivityManager. Callbacks fire when foreground
+//! activities change and signal an `eventfd` that callers can poll via epoll.
+//! After the eventfd fires, call `get_focused_package` to read the new value.
 
 use crate::CoreError;
 
@@ -28,47 +31,33 @@ use crate::CoreError;
 #[cfg(target_os = "android")]
 mod imp {
     use super::*;
-    use crate::android_property::android_property_get;
+    use crate::dex;
     use std::os::raw::{c_char, c_void};
+    use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
     // ── NDK binder status codes ───────────────────────────────────────────────
 
     const STATUS_OK: i32 = 0;
     const STATUS_UNKNOWN_TRANSACTION: i32 = -2;
-
-    // writeNoException() writes 0; any non-zero is a Java exception code.
     const EX_NONE: i32 = 0;
 
     // ── Interface constants ───────────────────────────────────────────────────
 
-    const ACTIVITY_MANAGER_DESCRIPTOR: &[u8] = b"android.app.IActivityManager\0";
-    const ACTIVITY_SERVICE_NAME: &[u8] = b"activity\0";
-    const LIBBINDER_NDK_PATH: &[u8] = b"/system/lib64/libbinder_ndk.so\0";
+    const AM_DESCRIPTOR:    &[u8] = b"android.app.IActivityManager\0";
+    const OBS_DESCRIPTOR:   &[u8] = b"android.app.IProcessObserver\0";
+    const ACTIVITY_SERVICE: &[u8] = b"activity\0";
+    const LIBBINDER_PATH:   &[u8] = b"/system/lib64/libbinder_ndk.so\0";
 
     // ── Tx code cache ─────────────────────────────────────────────────────────
-    //
-    // Format written by fgw (4 space-separated values):
-    //   observer_code  focused_task_code  api_mode  fg_activities_code
-    // api_mode: 1 = getFocusedRootTaskInfo (API 30+), 2 = getFocusedStackInfo (API 29)
+    // Format (watcher.c compatible): observer_code query_code api_mode fg_code
+    // api_mode: 1 = getFocusedRootTaskInfo, 2 = getFocusedStackInfo (API 29)
 
-    const TX_CACHE_PATH: &str = "/data/local/tmp/coreshift/tx_code.txt";
+    // ── Statics for observer callback (binder thread pool context) ────────────
+    // These are set once during observer setup before joinThreadPool, and then
+    // only read from the callback. Safe to access from multiple binder threads.
 
-    // ── SDK-version tx code table ─────────────────────────────────────────────
-
-    #[derive(Clone, Copy)]
-    struct TxEntry { api: u32, code: i32, legacy: bool }
-
-    static TX_TABLE: &[TxEntry] = &[
-        TxEntry { api: 29, code: 157, legacy: true  },
-        TxEntry { api: 30, code: 168, legacy: false },
-        TxEntry { api: 31, code: 176, legacy: false },
-        TxEntry { api: 32, code: 178, legacy: false },
-        TxEntry { api: 33, code: 181, legacy: false },
-        TxEntry { api: 34, code: 183, legacy: false },
-        TxEntry { api: 35, code: 187, legacy: false },
-    ];
-
-    const PROBE_WINDOW: i32 = 12;
+    static OBS_FG_CODE: AtomicU32 = AtomicU32::new(0);
+    static OBS_EVENTFD:  AtomicI32 = AtomicI32::new(-1);
 
     // ── Raw NDK type aliases ──────────────────────────────────────────────────
 
@@ -77,25 +66,39 @@ mod imp {
     type AIBinder_Class = c_void;
     type AParcel = c_void;
     type BinderStatus = i32;
-    type StringAllocator =
-        unsafe extern "C" fn(*mut c_void, i32, *mut *mut c_char) -> bool;
+    type StringAllocator = unsafe extern "C" fn(*mut c_void, i32, *mut *mut c_char) -> bool;
 
-    // ── AIBinder_Class no-op callbacks (client-side only) ────────────────────
+    // ── AIBinder_Class callbacks ──────────────────────────────────────────────
 
-    unsafe extern "C" fn on_create(_: *mut c_void) -> *mut c_void { std::ptr::null_mut() }
-    unsafe extern "C" fn on_destroy(_: *mut c_void) {}
-    unsafe extern "C" fn on_transact(
+    // AM client — no-op server side (we're a client only)
+    unsafe extern "C" fn am_on_create(_: *mut c_void) -> *mut c_void { std::ptr::null_mut() }
+    unsafe extern "C" fn am_on_destroy(_: *mut c_void) {}
+    unsafe extern "C" fn am_on_transact(
         _: *mut AIBinder, _: u32, _: *const AParcel, _: *mut AParcel,
     ) -> BinderStatus { STATUS_UNKNOWN_TRANSACTION }
 
-    // ── String allocator callback ─────────────────────────────────────────────
+    // IProcessObserver server callbacks
+    unsafe extern "C" fn obs_on_create(_: *mut c_void) -> *mut c_void { std::ptr::null_mut() }
+    unsafe extern "C" fn obs_on_destroy(_: *mut c_void) {}
+    unsafe extern "C" fn obs_on_transact(
+        _: *mut AIBinder, code: u32, _: *const AParcel, _: *mut AParcel,
+    ) -> BinderStatus {
+        if code == OBS_FG_CODE.load(Ordering::Relaxed) {
+            let efd = OBS_EVENTFD.load(Ordering::Relaxed);
+            if efd >= 0 {
+                let val: u64 = 1;
+                unsafe { libc::write(efd, &val as *const u64 as *const c_void, 8) };
+            }
+        }
+        STATUS_OK
+    }
+
+    // ── String allocator ─────────────────────────────────────────────────────
 
     unsafe extern "C" fn string_alloc(
-        cookie: *mut c_void,
-        length: i32,
-        buffer: *mut *mut c_char,
+        cookie: *mut c_void, length: i32, buffer: *mut *mut c_char,
     ) -> bool {
-        if length < 0 { return true; } // null string
+        if length < 0 { return true; }
         let s = unsafe { &mut *(cookie as *mut StringBuf) };
         s.0.reserve_exact(length as usize + 1);
         unsafe { s.0.as_mut_vec().resize(length as usize + 1, 0) };
@@ -104,12 +107,9 @@ mod imp {
     }
 
     struct StringBuf(String);
-
     impl StringBuf {
         fn new() -> Self { Self(String::new()) }
-
         fn finish(mut self) -> Option<String> {
-            // Strip the trailing NUL written by the NDK allocator.
             if let Some(pos) = self.0.as_bytes().iter().position(|&b| b == 0) {
                 unsafe { self.0.as_mut_vec().truncate(pos) };
             }
@@ -117,12 +117,10 @@ mod imp {
         }
     }
 
-    // ── NDK vtable ────────────────────────────────────────────────────────────
+    // ── Vtable ────────────────────────────────────────────────────────────────
 
     struct Vtable {
         get_service:         unsafe extern "C" fn(*const c_char) -> *mut AIBinder,
-        #[allow(dead_code)]
-        wait_for_service:    unsafe extern "C" fn(*const c_char) -> *mut AIBinder,
         class_define:        unsafe extern "C" fn(
                                  *const c_char,
                                  unsafe extern "C" fn(*mut c_void) -> *mut c_void,
@@ -130,14 +128,19 @@ mod imp {
                                  unsafe extern "C" fn(*mut AIBinder, u32, *const AParcel, *mut AParcel) -> BinderStatus,
                              ) -> *mut AIBinder_Class,
         associate_class:     unsafe extern "C" fn(*mut AIBinder, *mut AIBinder_Class) -> bool,
+        new_binder:          unsafe extern "C" fn(*const AIBinder_Class, *mut c_void) -> *mut AIBinder,
         prepare_transaction: unsafe extern "C" fn(*mut AIBinder, *mut *mut AParcel) -> BinderStatus,
         transact:            unsafe extern "C" fn(*mut AIBinder, u32, *mut *mut AParcel, *mut *mut AParcel, u32) -> BinderStatus,
         dec_strong:          unsafe extern "C" fn(*mut AIBinder),
         parcel_delete:       unsafe extern "C" fn(*mut AParcel),
         read_int32:          unsafe extern "C" fn(*const AParcel, *mut i32) -> BinderStatus,
-        #[allow(dead_code)]
-        read_bool:           unsafe extern "C" fn(*const AParcel, *mut bool) -> BinderStatus,
         read_string:         unsafe extern "C" fn(*const AParcel, *mut c_void, StringAllocator) -> BinderStatus,
+        write_strong_binder: unsafe extern "C" fn(*mut AParcel, *mut AIBinder) -> BinderStatus,
+        set_thread_pool_max: unsafe extern "C" fn(u32),
+        join_thread_pool:    unsafe extern "C" fn(),
+        // Optional: only present on API 29+, but all modern Android has this
+        #[allow(dead_code)]
+        read_bool:           Option<unsafe extern "C" fn(*const AParcel, *mut bool) -> BinderStatus>,
     }
 
     // ── RAII wrappers ─────────────────────────────────────────────────────────
@@ -150,25 +153,15 @@ mod imp {
         }
     }
 
-    struct OwnedParcel {
-        ptr: *mut AParcel,
-        delete: unsafe extern "C" fn(*mut AParcel),
-    }
+    struct OwnedParcel { ptr: *mut AParcel, delete: unsafe extern "C" fn(*mut AParcel) }
     impl Drop for OwnedParcel {
-        fn drop(&mut self) {
-            if !self.ptr.is_null() { unsafe { (self.delete)(self.ptr) }; }
-        }
+        fn drop(&mut self) { if !self.ptr.is_null() { unsafe { (self.delete)(self.ptr) }; } }
     }
 
-    struct OwnedBinder {
-        ptr: *mut AIBinder,
-        dec_strong: unsafe extern "C" fn(*mut AIBinder),
-    }
+    struct OwnedBinder { ptr: *mut AIBinder, dec_strong: unsafe extern "C" fn(*mut AIBinder) }
     unsafe impl Send for OwnedBinder {}
     impl Drop for OwnedBinder {
-        fn drop(&mut self) {
-            if !self.ptr.is_null() { unsafe { (self.dec_strong)(self.ptr) }; }
-        }
+        fn drop(&mut self) { if !self.ptr.is_null() { unsafe { (self.dec_strong)(self.ptr) }; } }
     }
 
     // ── dlsym helper ─────────────────────────────────────────────────────────
@@ -185,11 +178,19 @@ mod imp {
         }};
     }
 
+    macro_rules! dlsym_opt {
+        ($handle:expr, $name:literal, $ty:ty) => {{
+            let sym = unsafe {
+                libc::dlsym($handle, concat!($name, "\0").as_ptr() as *const c_char)
+            };
+            if sym.is_null() { None }
+            else { Some(unsafe { std::mem::transmute::<*mut c_void, $ty>(sym) }) }
+        }};
+    }
+
     fn load_vtable(handle: *mut c_void) -> Result<Vtable, CoreError> {
         Ok(Vtable {
             get_service: dlsym_fn!(handle, "AServiceManager_getService",
-                unsafe extern "C" fn(*const c_char) -> *mut AIBinder),
-            wait_for_service: dlsym_fn!(handle, "AServiceManager_waitForService",
                 unsafe extern "C" fn(*const c_char) -> *mut AIBinder),
             class_define: dlsym_fn!(handle, "AIBinder_Class_define",
                 unsafe extern "C" fn(
@@ -200,6 +201,8 @@ mod imp {
                 ) -> *mut AIBinder_Class),
             associate_class: dlsym_fn!(handle, "AIBinder_associateClass",
                 unsafe extern "C" fn(*mut AIBinder, *mut AIBinder_Class) -> bool),
+            new_binder: dlsym_fn!(handle, "AIBinder_new",
+                unsafe extern "C" fn(*const AIBinder_Class, *mut c_void) -> *mut AIBinder),
             prepare_transaction: dlsym_fn!(handle, "AIBinder_prepareTransaction",
                 unsafe extern "C" fn(*mut AIBinder, *mut *mut AParcel) -> BinderStatus),
             transact: dlsym_fn!(handle, "AIBinder_transact",
@@ -210,19 +213,22 @@ mod imp {
                 unsafe extern "C" fn(*mut AParcel)),
             read_int32: dlsym_fn!(handle, "AParcel_readInt32",
                 unsafe extern "C" fn(*const AParcel, *mut i32) -> BinderStatus),
-            read_bool: dlsym_fn!(handle, "AParcel_readBool",
-                unsafe extern "C" fn(*const AParcel, *mut bool) -> BinderStatus),
             read_string: dlsym_fn!(handle, "AParcel_readString",
                 unsafe extern "C" fn(*const AParcel, *mut c_void, StringAllocator) -> BinderStatus),
+            write_strong_binder: dlsym_fn!(handle, "AParcel_writeStrongBinder",
+                unsafe extern "C" fn(*mut AParcel, *mut AIBinder) -> BinderStatus),
+            set_thread_pool_max: dlsym_fn!(handle, "ABinderProcess_setThreadPoolMaxThreadCount",
+                unsafe extern "C" fn(u32)),
+            join_thread_pool: dlsym_fn!(handle, "ABinderProcess_joinThreadPool",
+                unsafe extern "C" fn()),
+            read_bool: dlsym_opt!(handle, "AParcel_readBool",
+                unsafe extern "C" fn(*const AParcel, *mut bool) -> BinderStatus),
         })
     }
 
-    // ── ParcelReader — safe parcel API ────────────────────────────────────────
+    // ── ParcelReader ──────────────────────────────────────────────────────────
 
-    struct ParcelReader<'a> {
-        vt: &'a Vtable,
-        parcel: &'a OwnedParcel,
-    }
+    struct ParcelReader<'a> { vt: &'a Vtable, parcel: &'a OwnedParcel }
 
     impl<'a> ParcelReader<'a> {
         fn read_i32(&self) -> Result<i32, CoreError> {
@@ -231,32 +237,22 @@ mod imp {
             if s != STATUS_OK { return Err(CoreError::binder(s, "AParcel_readInt32")); }
             Ok(v)
         }
-
         fn read_string(&self) -> Result<Option<String>, CoreError> {
             let mut buf = StringBuf::new();
             let s = unsafe {
-                (self.vt.read_string)(
-                    self.parcel.ptr,
-                    &mut buf as *mut StringBuf as *mut c_void,
-                    string_alloc,
-                )
+                (self.vt.read_string)(self.parcel.ptr, &mut buf as *mut StringBuf as *mut c_void, string_alloc)
             };
             if s != STATUS_OK { return Err(CoreError::binder(s, "AParcel_readString")); }
             Ok(buf.finish())
         }
-
         fn skip_i32s(&self, n: usize) -> Result<(), CoreError> {
             for _ in 0..n { self.read_i32()?; }
             Ok(())
         }
-
         fn skip_int_array(&self) -> Result<(), CoreError> {
             let count = self.read_i32()?.max(0) as usize;
             self.skip_i32s(count)
         }
-
-        // Read component name strings (count + strings), return first package.
-        // Component format: "com.pkg/.Activity" — package is left of '/'.
         fn read_first_package_from_names(&self) -> Result<Option<String>, CoreError> {
             let count = self.read_i32()?.max(0) as usize;
             let mut first: Option<String> = None;
@@ -270,201 +266,202 @@ mod imp {
         }
     }
 
-    // ── Response parsers (safe — no unsafe blocks) ────────────────────────────
-    //
-    // Called after exception (int32=0) and present (int32!=0) are consumed
-    // by get_focused_package. Mirrors watcher.c parseRootTaskInfoReply /
-    // parseStackInfoReply exactly.
+    // ── Response parsers ──────────────────────────────────────────────────────
 
-    // getFocusedRootTaskInfo (API 30+)
     fn parse_root_task_info_body(r: &ParcelReader<'_>) -> Result<Option<String>, CoreError> {
-        // scratch flag; if non-zero, 4 more ints follow (bounds-like fields)
         let scratch = r.read_i32()?;
         if scratch != 0 { r.skip_i32s(4)?; }
-        r.skip_int_array()?;               // child task IDs
-        r.read_first_package_from_names()  // child task names → first package
+        r.skip_int_array()?;
+        r.read_first_package_from_names()
     }
 
-    // getFocusedStackInfo (API 29)
     fn parse_stack_info_body(r: &ParcelReader<'_>) -> Result<Option<String>, CoreError> {
-        r.skip_i32s(5)?;                   // scratch fields
-        r.skip_int_array()?;               // task IDs
-        r.read_first_package_from_names()  // task names → first package
+        r.skip_i32s(5)?;
+        r.skip_int_array()?;
+        r.read_first_package_from_names()
     }
 
     // ── Tx code resolution ────────────────────────────────────────────────────
 
-    fn read_tx_cache() -> Option<(i32, bool)> {
-        let text = std::fs::read_to_string(TX_CACHE_PATH).ok()?;
-        // observer_code  focused_task_code  api_mode  fg_activities_code
+    pub struct TxCodes {
+        pub observer_code: u32,
+        pub query_code:    u32,
+        pub api_mode:      u8,  // 1 = RootTaskInfo, 2 = StackInfo
+        pub fg_code:       u32,
+    }
+
+    pub fn read_tx_cache(cache_path: &str) -> Option<TxCodes> {
+        let text = std::fs::read_to_string(cache_path).ok()?;
         let mut parts = text.split_whitespace();
-        let _observer: i32  = parts.next()?.parse().ok()?;
-        let tx_code: i32    = parts.next()?.parse().ok()?;
-        let api_mode: i32   = parts.next()?.parse().ok()?;
-        if tx_code <= 0 { return None; }
-        Some((tx_code, api_mode == 2)) // api_mode 2 = getFocusedStackInfo (legacy)
+        let obs:   u32 = parts.next()?.parse().ok()?;
+        let query: u32 = parts.next()?.parse().ok()?;
+        let api:   u8  = parts.next()?.parse().ok()?;
+        let fg:    u32 = parts.next()?.parse().ok()?;
+        // All four must be nonzero and api_mode must be valid (watcher.c rule)
+        if obs == 0 || query == 0 || fg == 0 || (api != 1 && api != 2) { return None; }
+        Some(TxCodes { observer_code: obs, query_code: query, api_mode: api, fg_code: fg })
     }
 
-    fn sdk_version() -> Option<u32> {
-        android_property_get("ro.build.version.sdk")
-            .and_then(|s| s.trim().parse().ok())
+    pub fn write_tx_cache(cache_path: &str, codes: &TxCodes) {
+        let _ = std::fs::create_dir_all(
+            std::path::Path::new(cache_path).parent().unwrap_or(std::path::Path::new("/"))
+        );
+        let _ = std::fs::write(
+            cache_path,
+            format!("{} {} {} {}\n", codes.observer_code, codes.query_code, codes.api_mode, codes.fg_code),
+        );
     }
 
-    fn table_lookup(api: u32) -> Option<(i32, bool)> {
-        TX_TABLE.iter()
-            .filter(|e| e.api <= api)
-            .last()
-            .map(|e| (e.code, e.legacy))
-    }
-
-    fn probe_window(api: u32) -> impl Iterator<Item = (i32, bool)> {
-        let centre = table_lookup(api).map(|(c, _)| c).unwrap_or(170);
-        let legacy_threshold = 165i32;
-        ((centre - PROBE_WINDOW)..(centre + PROBE_WINDOW))
-            .map(move |c| (c, c < legacy_threshold))
+    pub fn resolve_tx_codes(cache_path: &str) -> Result<TxCodes, CoreError> {
+        if let Some(codes) = read_tx_cache(cache_path) {
+            return Ok(codes);
+        }
+        let (obs, query, api, fg) = dex::resolve_tx_codes_from_dex()
+            .ok_or_else(|| CoreError::binder(-1, "tx_code_resolution:dex_parse_failed"))?;
+        let codes = TxCodes { observer_code: obs, query_code: query, api_mode: api, fg_code: fg };
+        write_tx_cache(cache_path, &codes);
+        Ok(codes)
     }
 
     // ── ActivityManagerBinder ─────────────────────────────────────────────────
 
     pub struct ActivityManagerBinder {
-        _lib:     DlHandle,
-        vt:       Vtable,
-        _class:   *mut AIBinder_Class,
-        service:  OwnedBinder,
-        tx_code:  i32,
-        legacy:   bool,
+        _lib:    DlHandle,
+        vt:      Vtable,
+        _class:  *mut AIBinder_Class,
+        service: OwnedBinder,
+        tx_code: u32,
+        legacy:  bool,
     }
-
-    // SAFETY: AIBinder is internally reference-counted and thread-safe.
     unsafe impl Send for ActivityManagerBinder {}
 
     impl ActivityManagerBinder {
-        pub fn open() -> Result<Self, CoreError> {
-            let handle = unsafe {
-                libc::dlopen(
-                    LIBBINDER_NDK_PATH.as_ptr() as *const c_char,
-                    libc::RTLD_NOW | libc::RTLD_LOCAL,
-                )
-            };
-            if handle.is_null() {
-                return Err(CoreError::binder(-1, "dlopen:libbinder_ndk.so"));
-            }
+        fn open_inner(handle: *mut c_void) -> Result<(DlHandle, Vtable, *mut AIBinder_Class, OwnedBinder), CoreError> {
             let lib = DlHandle(handle);
             let vt = load_vtable(handle)?;
 
-            let class = unsafe {
+            let am_class = unsafe {
                 (vt.class_define)(
-                    ACTIVITY_MANAGER_DESCRIPTOR.as_ptr() as *const c_char,
-                    on_create, on_destroy, on_transact,
+                    AM_DESCRIPTOR.as_ptr() as *const c_char,
+                    am_on_create, am_on_destroy, am_on_transact,
                 )
             };
-            if class.is_null() {
-                return Err(CoreError::binder(-1, "AIBinder_Class_define"));
-            }
+            if am_class.is_null() { return Err(CoreError::binder(-1, "AIBinder_Class_define:AM")); }
 
-            let raw_service = unsafe {
-                (vt.get_service)(ACTIVITY_SERVICE_NAME.as_ptr() as *const c_char)
-            };
-            if raw_service.is_null() {
-                return Err(CoreError::binder(-1, "AServiceManager_getService:activity"));
-            }
-            unsafe { (vt.associate_class)(raw_service, class) };
+            let raw = unsafe { (vt.get_service)(ACTIVITY_SERVICE.as_ptr() as *const c_char) };
+            if raw.is_null() { return Err(CoreError::binder(-1, "AServiceManager_getService:activity")); }
+            unsafe { (vt.associate_class)(raw, am_class) };
 
-            let service = OwnedBinder { ptr: raw_service, dec_strong: vt.dec_strong };
-            let (tx_code, legacy) = Self::resolve_tx(&vt, raw_service, class)?;
-
-            Ok(Self { _lib: lib, vt, _class: class, service, tx_code, legacy })
+            let service = OwnedBinder { ptr: raw, dec_strong: vt.dec_strong };
+            Ok((lib, vt, am_class, service))
         }
 
-        fn resolve_tx(
-            vt: &Vtable,
-            service: *mut AIBinder,
-            _class: *mut AIBinder_Class,
-        ) -> Result<(i32, bool), CoreError> {
-            if let Some(pair) = read_tx_cache() {
-                return Ok(pair);
-            }
-
-            let api = sdk_version().unwrap_or(30);
-
-            let pair = if let Some(pair) = table_lookup(api) {
-                if Self::tx_code_valid(vt, service, pair.0) {
-                    pair
-                } else {
-                    probe_window(api)
-                        .find(|&(code, _)| Self::tx_code_valid(vt, service, code))
-                        .ok_or_else(|| CoreError::binder(-1, "tx_code_resolution"))?
-                }
-            } else {
-                probe_window(api)
-                    .find(|&(code, _)| Self::tx_code_valid(vt, service, code))
-                    .ok_or_else(|| CoreError::binder(-1, "tx_code_resolution"))?
+        fn dlopen_libbinder() -> Result<*mut c_void, CoreError> {
+            use std::os::raw::c_char;
+            let handle = unsafe {
+                libc::dlopen(LIBBINDER_PATH.as_ptr() as *const c_char, libc::RTLD_NOW | libc::RTLD_LOCAL)
             };
-
-            // Persist so future daemon restarts skip probe entirely.
-            // Format: observer_code focused_task_code api_mode fg_code
-            // We only own focused_task_code; write 0 for fields fgw manages.
-            let api_mode = if pair.1 { 2i32 } else { 1i32 };
-            let _ = std::fs::create_dir_all("/data/local/tmp/coreshift");
-            let _ = std::fs::write(TX_CACHE_PATH, format!("0 {} {} 0\n", pair.0, api_mode));
-
-            Ok(pair)
+            if handle.is_null() { return Err(CoreError::binder(-1, "dlopen:libbinder_ndk.so")); }
+            Ok(handle)
         }
 
-        fn tx_code_valid(vt: &Vtable, service: *mut AIBinder, code: i32) -> bool {
+        /// Open ActivityManager binder (polling mode — no observer).
+        /// Resolves the query tx code from cache or DEX.
+        pub fn open(cache_path: &str) -> Result<Self, CoreError> {
+            let handle = Self::dlopen_libbinder()?;
+            let (lib, vt, class, service) = Self::open_inner(handle)?;
+            let codes = resolve_tx_codes(cache_path)?;
+            let legacy = codes.api_mode == 2;
+            Ok(Self { _lib: lib, vt, _class: class, service, tx_code: codes.query_code, legacy })
+        }
+
+        /// Open ActivityManager binder and register as IProcessObserver.
+        ///
+        /// Returns `(Self, eventfd_raw_fd)`. The eventfd becomes readable
+        /// whenever `onForegroundActivitiesChanged` fires. Caller must add it
+        /// to epoll. After the event fires, call `get_focused_package`.
+        pub fn open_with_observer(cache_path: &str) -> Result<(Self, i32), CoreError> {
+            let handle = Self::dlopen_libbinder()?;
+            let (lib, vt, am_class, service) = Self::open_inner(handle)?;
+            let codes = resolve_tx_codes(cache_path)?;
+            let legacy = codes.api_mode == 2;
+
+            // Create eventfd for callback → epoll bridge
+            let efd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+            if efd < 0 { return Err(CoreError::sys(unsafe { *libc::__errno() }, "eventfd")); }
+
+            // Store fg_code and eventfd in statics for the callback
+            OBS_FG_CODE.store(codes.fg_code, Ordering::Relaxed);
+            OBS_EVENTFD.store(efd, Ordering::Relaxed);
+
+            // Define IProcessObserver class (we're the server)
+            let obs_class = unsafe {
+                (vt.class_define)(
+                    OBS_DESCRIPTOR.as_ptr() as *const c_char,
+                    obs_on_create, obs_on_destroy, obs_on_transact,
+                )
+            };
+            if obs_class.is_null() {
+                unsafe { libc::close(efd) };
+                return Err(CoreError::binder(-1, "AIBinder_Class_define:Observer"));
+            }
+
+            // Instantiate our observer binder object
+            let obs_binder = unsafe { (vt.new_binder)(obs_class, std::ptr::null_mut()) };
+            if obs_binder.is_null() {
+                unsafe { libc::close(efd) };
+                return Err(CoreError::binder(-1, "AIBinder_new:Observer"));
+            }
+            unsafe { (vt.associate_class)(obs_binder, obs_class) };
+
+            // Call registerProcessObserver(observer)
             let mut in_ptr: *mut AParcel = std::ptr::null_mut();
-            if unsafe { (vt.prepare_transaction)(service, &mut in_ptr) } != STATUS_OK {
-                return false;
+            let s = unsafe { (vt.prepare_transaction)(service.ptr, &mut in_ptr) };
+            if s != STATUS_OK {
+                unsafe { libc::close(efd) };
+                return Err(CoreError::binder(s, "prepareTransaction:registerObserver"));
             }
+            unsafe { (vt.write_strong_binder)(in_ptr, obs_binder) };
             let mut out_ptr: *mut AParcel = std::ptr::null_mut();
             let s = unsafe {
-                (vt.transact)(service, code as u32, &mut in_ptr, &mut out_ptr, 0)
+                (vt.transact)(service.ptr, codes.observer_code, &mut in_ptr, &mut out_ptr, 0)
             };
-            let out = OwnedParcel { ptr: out_ptr, delete: vt.parcel_delete };
-            if s != STATUS_OK { return false; }
-            let r = ParcelReader { vt, parcel: &out };
-            r.read_i32().map(|ex| ex == EX_NONE).unwrap_or(false)
-            // out dropped here → parcel_delete called automatically
+            if !out_ptr.is_null() { unsafe { (vt.parcel_delete)(out_ptr) }; }
+            if s != STATUS_OK {
+                unsafe { libc::close(efd) };
+                return Err(CoreError::binder(s, "transact:registerProcessObserver"));
+            }
+
+            // Start binder thread pool — blocks forever in background thread
+            unsafe { (vt.set_thread_pool_max)(0) };
+            let join_fn = vt.join_thread_pool;
+            std::thread::spawn(move || unsafe { join_fn() });
+
+            let binder = Self { _lib: lib, vt, _class: am_class, service, tx_code: codes.query_code, legacy };
+            Ok((binder, efd))
         }
 
         fn do_transact(&self) -> Result<OwnedParcel, CoreError> {
             let mut in_ptr: *mut AParcel = std::ptr::null_mut();
             let s = unsafe { (self.vt.prepare_transaction)(self.service.ptr, &mut in_ptr) };
-            if s != STATUS_OK {
-                return Err(CoreError::binder(s, "AIBinder_prepareTransaction"));
-            }
+            if s != STATUS_OK { return Err(CoreError::binder(s, "AIBinder_prepareTransaction")); }
             let mut out_ptr: *mut AParcel = std::ptr::null_mut();
             let s = unsafe {
-                (self.vt.transact)(
-                    self.service.ptr, self.tx_code as u32,
-                    &mut in_ptr, &mut out_ptr, 0,
-                )
+                (self.vt.transact)(self.service.ptr, self.tx_code, &mut in_ptr, &mut out_ptr, 0)
             };
             let out = OwnedParcel { ptr: out_ptr, delete: self.vt.parcel_delete };
-            if s != STATUS_OK {
-                return Err(CoreError::binder(s, "AIBinder_transact"));
-            }
+            if s != STATUS_OK { return Err(CoreError::binder(s, "AIBinder_transact")); }
             Ok(out)
         }
 
         pub fn get_focused_package(&self) -> Result<Option<String>, CoreError> {
             let out = self.do_transact()?;
             let r = ParcelReader { vt: &self.vt, parcel: &out };
-
             let ex = r.read_i32()?;
-            if ex != EX_NONE {
-                return Err(CoreError::binder(ex, "getFocusedTask:exception"));
-            }
+            if ex != EX_NONE { return Err(CoreError::binder(ex, "getFocusedTask:exception")); }
             let present = r.read_i32()?;
-            if present == 0 {
-                return Ok(None);
-            }
-            if self.legacy {
-                parse_stack_info_body(&r)
-            } else {
-                parse_root_task_info_body(&r)
-            }
-            // out dropped here → parcel_delete called automatically
+            if present == 0 { return Ok(None); }
+            if self.legacy { parse_stack_info_body(&r) } else { parse_root_task_info_body(&r) }
         }
     }
 }
@@ -472,20 +469,34 @@ mod imp {
 // ── Public re-exports ─────────────────────────────────────────────────────────
 
 #[cfg(target_os = "android")]
-pub use imp::ActivityManagerBinder;
+pub use imp::{ActivityManagerBinder, TxCodes, read_tx_cache, write_tx_cache, resolve_tx_codes};
 
-// ── Non-Android stub ──────────────────────────────────────────────────────────
+// ── Non-Android stubs ─────────────────────────────────────────────────────────
 
 #[cfg(not(target_os = "android"))]
 pub struct ActivityManagerBinder;
 
 #[cfg(not(target_os = "android"))]
 impl ActivityManagerBinder {
-    pub fn open() -> Result<Self, CoreError> {
-        Err(CoreError::binder(-1, "binder:unsupported platform"))
+    pub fn open(_cache_path: &str) -> Result<Self, crate::CoreError> {
+        Err(crate::CoreError::binder(-1, "binder:unsupported platform"))
     }
+    pub fn open_with_observer(_cache_path: &str) -> Result<(Self, i32), crate::CoreError> {
+        Err(crate::CoreError::binder(-1, "binder:unsupported platform"))
+    }
+    pub fn get_focused_package(&self) -> Result<Option<String>, crate::CoreError> {
+        Err(crate::CoreError::binder(-1, "binder:unsupported platform"))
+    }
+}
 
-    pub fn get_focused_package(&self) -> Result<Option<String>, CoreError> {
-        Err(CoreError::binder(-1, "binder:unsupported platform"))
-    }
+#[cfg(not(target_os = "android"))]
+pub struct TxCodes { pub observer_code: u32, pub query_code: u32, pub api_mode: u8, pub fg_code: u32 }
+
+#[cfg(not(target_os = "android"))]
+pub fn read_tx_cache(_: &str) -> Option<TxCodes> { None }
+#[cfg(not(target_os = "android"))]
+pub fn write_tx_cache(_: &str, _: &TxCodes) {}
+#[cfg(not(target_os = "android"))]
+pub fn resolve_tx_codes(_: &str) -> Result<TxCodes, crate::CoreError> {
+    Err(crate::CoreError::binder(-1, "binder:unsupported platform"))
 }
