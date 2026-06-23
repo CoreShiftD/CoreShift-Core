@@ -52,6 +52,7 @@ pub mod inotify;
 pub mod io;
 pub mod log;
 pub mod proc;
+pub mod process;
 pub mod reactor;
 pub mod signal;
 pub mod spawn;

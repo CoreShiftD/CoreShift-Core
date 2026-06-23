@@ -16,12 +16,25 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 pub type SignalSet = libc::sigset_t;
 pub type ThreadId = libc::pthread_t;
 
-pub const SIGINT: i32 = libc::SIGINT;
+pub const SIGINT: i32  = libc::SIGINT;
 pub const SIGTERM: i32 = libc::SIGTERM;
 pub const SIGPIPE: i32 = libc::SIGPIPE;
 pub const SIGKILL: i32 = libc::SIGKILL;
 pub const SIGUSR1: i32 = libc::SIGUSR1;
 pub const SIGUSR2: i32 = libc::SIGUSR2;
+pub const SIGCHLD: i32 = libc::SIGCHLD;
+pub const SIGHUP: i32  = libc::SIGHUP;
+
+/// Type alias for the kernel signal info structure read from a `signalfd`.
+pub type SignalfdSiginfo = libc::signalfd_siginfo;
+
+/// Set a signal's disposition to SIG_IGN.
+///
+/// # Safety
+/// Changes process-global signal disposition.
+pub unsafe fn signal_ignore(sig: i32) {
+    unsafe { libc::signal(sig, libc::SIG_IGN) };
+}
 
 static SHUTDOWN_FLAG_PTR: AtomicPtr<AtomicBool> = AtomicPtr::new(std::ptr::null_mut());
 

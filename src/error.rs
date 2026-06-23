@@ -66,6 +66,16 @@ impl fmt::Display for CoreError {
 
 impl std::error::Error for CoreError {}
 
+/// Common errno constants, re-exported so callers need not depend on `libc`.
+pub mod errno {
+    pub const EADDRINUSE: i32 = libc::EADDRINUSE;
+    pub const EPIPE: i32      = libc::EPIPE;
+    pub const EAGAIN: i32     = libc::EAGAIN;
+    pub const EINTR: i32      = libc::EINTR;
+    pub const ENOENT: i32     = libc::ENOENT;
+    pub const EACCES: i32     = libc::EACCES;
+}
+
 #[inline(always)]
 pub(crate) fn syscall_ret(ret: i32, op: &'static str) -> Result<(), CoreError> {
     if ret == -1 {
