@@ -15,7 +15,7 @@
 //! `IActivityManager` transaction codes are AIDL-generated and shift with each
 //! AOSP release. Resolution order (no subprocess required):
 //!
-//! 1. Parse `/data/local/tmp/tx_code.txt` if present (written by fgw).
+//! 1. Parse `/data/local/tmp/coreshift/tx_code.txt` if present (written by fgw).
 //! 2. Look up a known code from the `ro.build.version.sdk` property table.
 //! 3. Linear probe codes in a narrow SDK-version-dependent window.
 
@@ -51,7 +51,7 @@ mod imp {
     //   observer_code  focused_task_code  api_mode  fg_activities_code
     // api_mode: 1 = getFocusedRootTaskInfo (API 30+), 2 = getFocusedStackInfo (API 29)
 
-    const TX_CACHE_PATH: &str = "/data/local/tmp/tx_code.txt";
+    const TX_CACHE_PATH: &str = "/data/local/tmp/coreshift/tx_code.txt";
 
     // ── SDK-version tx code table ─────────────────────────────────────────────
 
@@ -405,6 +405,7 @@ mod imp {
             // Format: observer_code focused_task_code api_mode fg_code
             // We only own focused_task_code; write 0 for fields fgw manages.
             let api_mode = if pair.1 { 2i32 } else { 1i32 };
+            let _ = std::fs::create_dir_all("/data/local/tmp/coreshift");
             let _ = std::fs::write(TX_CACHE_PATH, format!("0 {} {} 0\n", pair.0, api_mode));
 
             Ok(pair)
