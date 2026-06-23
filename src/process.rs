@@ -88,6 +88,19 @@ pub fn set_pdeathsig(sig: i32) -> Result<(), CoreError> {
     )
 }
 
+/// Duplicate `src_fd` onto `dst_fd` and close `src_fd`.
+///
+/// Equivalent to `dup2(src_fd, dst_fd); close(src_fd)`.
+///
+/// # Safety
+/// Manipulates raw file descriptors.
+pub unsafe fn redirect_fd_to(src_fd: i32, dst_fd: i32) {
+    unsafe {
+        libc::dup2(src_fd, dst_fd);
+        libc::close(src_fd);
+    }
+}
+
 /// Drop process privileges to the given UID (`setresuid`).
 ///
 /// Sets real, effective, and saved UID to `uid`.
