@@ -88,6 +88,26 @@ pub fn set_pdeathsig(sig: i32) -> Result<(), CoreError> {
     )
 }
 
+/// Drop process privileges to the given UID (`setresuid`).
+///
+/// Sets real, effective, and saved UID to `uid`.
+pub fn setuid(uid: u32) -> Result<(), CoreError> {
+    syscall_ret(
+        unsafe { libc::setresuid(uid, uid, uid) },
+        "setresuid",
+    )
+}
+
+/// Drop process privileges to the given GID (`setresgid`).
+///
+/// Sets real, effective, and saved GID to `gid`.
+pub fn setgid(gid: u32) -> Result<(), CoreError> {
+    syscall_ret(
+        unsafe { libc::setresgid(gid, gid, gid) },
+        "setresgid",
+    )
+}
+
 /// Close all file descriptors >= `start`.
 ///
 /// Silently ignores `EBADF` (already closed or never open).
