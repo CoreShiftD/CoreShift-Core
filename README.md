@@ -37,18 +37,12 @@ behavior, package discovery, daemon protocols, or preload rules.
 
 ## Binder observer
 
-`ActivityManagerBinder::open_with_observer(cache_path)` registers the calling
-process as an `IProcessObserver` with Android's ActivityManager and returns a
-raw `eventfd` that becomes readable whenever `onForegroundActivitiesChanged`
-fires. Callers add the fd to their epoll reactor and call
-`get_focused_package()` on the event. Transaction codes are resolved in order:
+Registers as `IProcessObserver` with ActivityManager; returns an `eventfd`
+that fires on `onForegroundActivitiesChanged`. Transaction codes resolved from
+`tx_code.txt` cache or by parsing `TRANSACTION_*` fields directly from
+`framework.jar` DEX — no subprocess required.
 
-1. `tx_code.txt` cache (written by this crate or compatible tools)
-2. Parse `framework.jar` DEX — `TRANSACTION_*` static fields in
-   `IActivityManager$Stub` and `IProcessObserver$Stub`
-
-The binder observer technique is based on the approach by
-**[sehan64](https://github.com/sehan64)**.
+See [docs/BINDER_OBSERVER.md](docs/BINDER_OBSERVER.md) for full details.
 
 ## Release Dependency
 
@@ -60,6 +54,7 @@ coreshift-core = "1.2.8"
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md)
+- [Binder Observer](docs/BINDER_OBSERVER.md)
 - [I/O Subsystem](docs/IO_SUBSYSTEM.md)
 - [Signal Handling](docs/SIGNAL_HANDLING.md)
 - [Preload primitives](docs/PRELOAD_PRIMITIVES.md)
