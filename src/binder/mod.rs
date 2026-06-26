@@ -9,11 +9,8 @@
 //!
 //! ## Transaction code resolution
 //!
-//! Resolution order (no subprocess required):
-//!
-//! 1. `tx_code.txt` cache (written by fgw or a previous run).
-//! 2. Parse `framework.jar` DEX — reads `TRANSACTION_*` static int fields
-//!    from `IActivityManager$Stub` and `IProcessObserver$Stub` directly.
+//! Transaction codes are resolved fresh from `framework.jar` DEX on each
+//! startup; no persistent cache.
 //!
 //! ## Observer mode
 //!
@@ -316,15 +313,10 @@ mod imp {
         );
     }
 
-    pub fn resolve_tx_codes(cache_path: &str) -> Result<TxCodes, CoreError> {
-        if let Some(codes) = read_tx_cache(cache_path) {
-            return Ok(codes);
-        }
+    pub fn resolve_tx_codes(_cache_path: &str) -> Result<TxCodes, CoreError> {
         let (obs, query, api, fg) = dex::resolve_tx_codes_from_dex()
             .ok_or_else(|| CoreError::binder(-1, "tx_code_resolution:dex_parse_failed"))?;
-        let codes = TxCodes { observer_code: obs, query_code: query, api_mode: api, fg_code: fg };
-        write_tx_cache(cache_path, &codes);
-        Ok(codes)
+        Ok(TxCodes { observer_code: obs, query_code: query, api_mode: api, fg_code: fg })
     }
 
     // ── ActivityManagerBinder ─────────────────────────────────────────────────

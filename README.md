@@ -48,7 +48,7 @@ See [docs/BINDER_OBSERVER.md](docs/BINDER_OBSERVER.md) for full details.
 
 ```toml
 [dependencies]
-coreshift-core = "1.2.8"
+coreshift-core = "1.2.9"
 ```
 
 ## Documentation
