@@ -82,13 +82,14 @@ pub fn uevent_open() -> Result<Fd, CoreError> {
     imp::uevent_open()
 }
 
-/// Drain all pending uevent messages; return the last battery `(level_pct, status)` seen.
+/// Drain all pending uevent messages; return the last `power_supply` event seen.
 ///
-/// Parses messages for `SUBSYSTEM=power_supply` with `POWER_SUPPLY_CAPACITY`.
-/// Returns `None` if the queue contained no battery capacity events.
+/// Returns `(capacity, status)` where `capacity` is `None` if `POWER_SUPPLY_CAPACITY`
+/// was absent from the uevent (caller should fall back to sysfs).
+/// Returns `None` if the queue contained no `power_supply` events at all.
 /// Must be called in a loop after `EPOLLET` fires to drain the edge-triggered fd.
-pub fn uevent_drain_battery(fd: &Fd) -> Option<(u8, String)> {
-    let mut result: Option<(u8, String)> = None;
+pub fn uevent_drain_battery(fd: &Fd) -> Option<(Option<u8>, String)> {
+    let mut result: Option<(Option<u8>, String)> = None;
     let mut buf = [0u8; 4096];
     loop {
         match imp::uevent_recv_raw(fd, &mut buf) {
@@ -103,7 +104,13 @@ pub fn uevent_drain_battery(fd: &Fd) -> Option<(u8, String)> {
     result
 }
 
-fn parse_battery(msg: &[u8]) -> Option<(u8, String)> {
+/// Receive one raw uevent message. Returns the number of bytes written into `buf`,
+/// or `None` if no message is pending (`EAGAIN`).
+pub fn uevent_recv(fd: &Fd, buf: &mut [u8]) -> Option<usize> {
+    imp::uevent_recv_raw(fd, buf)
+}
+
+fn parse_battery(msg: &[u8]) -> Option<(Option<u8>, String)> {
     let parts: Vec<&str> = msg
         .split(|&b| b == 0)
         .filter_map(|s| std::str::from_utf8(s).ok())
@@ -116,7 +123,7 @@ fn parse_battery(msg: &[u8]) -> Option<(u8, String)> {
 
     let cap = parts.iter()
         .find_map(|s| s.strip_prefix("POWER_SUPPLY_CAPACITY="))
-        .and_then(|v| v.parse::<u8>().ok())?;
+        .and_then(|v| v.parse::<u8>().ok());
 
     let status = parts.iter()
         .find_map(|s| s.strip_prefix("POWER_SUPPLY_STATUS="))

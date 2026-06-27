@@ -295,8 +295,32 @@ pub fn bind_unix_listener(
 /// - `EINPROGRESS`: Connection is in progress.
 /// - `ENOENT`: The socket path does not exist.
 pub fn connect_unix_stream(addr: UnixSocketAddr<'_>) -> Result<UnixConnectResult, CoreError> {
-    let encoded = UnixSockAddr::new(addr, "unix connect address")?;
+    connect_unix_stream_as(addr, None)
+}
+
+/// Like [`connect_unix_stream`] but binds the client socket to `local` before connecting,
+/// so the peer name appears in `/proc/net/unix` with an identifiable label.
+pub fn connect_unix_stream_named(
+    remote: UnixSocketAddr<'_>,
+    local: UnixSocketAddr<'_>,
+) -> Result<UnixConnectResult, CoreError> {
+    connect_unix_stream_as(remote, Some(local))
+}
+
+fn connect_unix_stream_as(
+    remote: UnixSocketAddr<'_>,
+    local: Option<UnixSocketAddr<'_>>,
+) -> Result<UnixConnectResult, CoreError> {
+    let encoded = UnixSockAddr::new(remote, "unix connect address")?;
     let fd = new_unix_stream_socket()?;
+
+    if let Some(la) = local {
+        let lb = UnixSockAddr::new(la, "unix bind local name")?;
+        let r = unsafe { libc::bind(fd.as_raw_fd(), lb.as_ptr(), lb.len()) };
+        if r < 0 {
+            return Err(CoreError::sys(errno(), "bind local name"));
+        }
+    }
 
     loop {
         let ret = unsafe { libc::connect(fd.as_raw_fd(), encoded.as_ptr(), encoded.len()) };
