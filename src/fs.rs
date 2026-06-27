@@ -99,6 +99,34 @@ pub fn readahead(fd: impl AsRawFd, offset: u64, len: usize) -> Result<(), CoreEr
     readahead_raw(fd.as_raw_fd(), offset, len)
 }
 
+// ── fadvise ──────────────────────────────────────────────────────────────────
+
+pub const FADV_NORMAL:     i32 = libc::POSIX_FADV_NORMAL;
+pub const FADV_RANDOM:     i32 = libc::POSIX_FADV_RANDOM;
+pub const FADV_SEQUENTIAL: i32 = libc::POSIX_FADV_SEQUENTIAL;
+pub const FADV_WILLNEED:   i32 = libc::POSIX_FADV_WILLNEED;
+pub const FADV_DONTNEED:   i32 = libc::POSIX_FADV_DONTNEED;
+pub const FADV_NOREUSE:    i32 = libc::POSIX_FADV_NOREUSE;
+
+/// Advise the kernel on the expected access pattern for a file range.
+///
+/// `offset` and `len` define the byte range; `len = 0` means "to end of file".
+/// `advice` is one of the `FADV_*` constants.
+///
+/// Unlike most syscalls, `posix_fadvise` returns the error code directly
+/// rather than setting `errno`.
+///
+/// ### Errors
+/// - `EBADF`: invalid file descriptor.
+/// - `EINVAL`: invalid advice value or unsupported `len`.
+/// - `ESPIPE`: the fd refers to a pipe.
+pub fn fadvise(fd: impl AsRawFd, offset: u64, len: usize, advice: i32) -> Result<(), CoreError> {
+    let ret = unsafe {
+        libc::posix_fadvise(fd.as_raw_fd(), offset as libc::off_t, len as libc::off_t, advice)
+    };
+    if ret == 0 { Ok(()) } else { Err(CoreError::sys(ret, "posix_fadvise")) }
+}
+
 /// Map a file range, advise the kernel that it will be needed, then unmap it.
 ///
 /// `offset` must be page-aligned. This low-level primitive rejects unaligned
