@@ -52,6 +52,7 @@ pub mod fs;
 pub mod inotify;
 pub mod io;
 pub mod log;
+pub mod netlink;
 pub mod proc;
 pub mod process;
 pub mod reactor;

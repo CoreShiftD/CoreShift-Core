@@ -38,9 +38,7 @@ behavior, package discovery, daemon protocols, or preload rules.
 ## Binder observer
 
 Registers as `IProcessObserver` with ActivityManager; returns an `eventfd`
-that fires on `onForegroundActivitiesChanged`. Transaction codes resolved from
-`tx_code.txt` cache or by parsing `TRANSACTION_*` fields directly from
-`framework.jar` DEX — no subprocess required.
+that fires on `onForegroundActivitiesChanged`. Transaction codes are resolved by parsing `TRANSACTION_*` fields directly from `framework.jar` DEX at startup — no subprocess required.
 
 See [docs/BINDER_OBSERVER.md](docs/BINDER_OBSERVER.md) for full details.
 

@@ -1,6 +1,6 @@
 # Binder Observer
 
-`ActivityManagerBinder::open_with_observer(cache_path)` registers the calling
+`ActivityManagerBinder::open_with_observer()` registers the calling
 process as an `IProcessObserver` with Android's ActivityManager. On success it
 returns a raw `eventfd` that becomes readable whenever
 `onForegroundActivitiesChanged` fires.
@@ -13,20 +13,11 @@ Add the returned fd to an epoll reactor. On event:
 2. Call `get_focused_package()` — this calls `getFocusedRootTaskInfo` inside
    the observer callback context, where it returns live (non-stale) data.
 
-The cache path (`tx_code.txt`) is the only persistent state required — no
-`packages.xml` parsing, no cgroup reads, no PID mapping.
+No persistent transaction-code cache is used; codes are resolved from `framework.jar` DEX at startup.
 
 ## Transaction code resolution
 
-Codes are resolved once at startup in order:
-
-1. `tx_code.txt` cache — format: `observer_code query_code api_mode fg_code`
-2. Parse `framework.jar` DEX — reads `TRANSACTION_*` static `int` fields from
-   `IActivityManager$Stub` and `IProcessObserver$Stub` directly from the ZIP
-   STORED entry, no subprocess or `app_process` required.
-
-The resolved codes are written back to cache so subsequent startups skip DEX
-parsing.
+Codes are resolved once at startup by parsing `TRANSACTION_*` static `int` fields from `IActivityManager` and `IProcessObserver` directly from the ZIP STORED DEX entries in `framework.jar`, with no subprocess or `app_process` required.
 
 ## Lifetime
 

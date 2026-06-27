@@ -19,15 +19,13 @@
 //! activities change and signal an `eventfd` that callers can poll via epoll.
 //! After the eventfd fires, call `get_focused_package` to read the new value.
 
-use crate::CoreError;
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Android-only implementation
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(target_os = "android")]
 mod imp {
-    use super::*;
+    use crate::CoreError;
     use crate::dex;
     use std::os::raw::{c_char, c_void};
     use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
@@ -135,8 +133,8 @@ mod imp {
         write_strong_binder: unsafe extern "C" fn(*mut AParcel, *mut AIBinder) -> BinderStatus,
         set_thread_pool_max: unsafe extern "C" fn(u32),
         join_thread_pool:    unsafe extern "C" fn(),
+        write_int32:         unsafe extern "C" fn(*mut AParcel, i32) -> BinderStatus,
         // Optional: only present on API 29+, but all modern Android has this
-        #[allow(dead_code)]
         read_bool:           Option<unsafe extern "C" fn(*const AParcel, *mut bool) -> BinderStatus>,
     }
 
@@ -222,6 +220,8 @@ mod imp {
                 unsafe extern "C" fn(u32)),
             join_thread_pool: dlsym_fn!(handle, "ABinderProcess_joinThreadPool",
                 unsafe extern "C" fn()),
+            write_int32: dlsym_fn!(handle, "AParcel_writeInt32",
+                unsafe extern "C" fn(*mut AParcel, i32) -> BinderStatus),
             read_bool: dlsym_opt!(handle, "AParcel_readBool",
                 unsafe extern "C" fn(*const AParcel, *mut bool) -> BinderStatus),
         })
@@ -291,29 +291,7 @@ mod imp {
         pub fg_code:       u32,
     }
 
-    pub fn read_tx_cache(cache_path: &str) -> Option<TxCodes> {
-        let text = std::fs::read_to_string(cache_path).ok()?;
-        let mut parts = text.split_whitespace();
-        let obs:   u32 = parts.next()?.parse().ok()?;
-        let query: u32 = parts.next()?.parse().ok()?;
-        let api:   u8  = parts.next()?.parse().ok()?;
-        let fg:    u32 = parts.next()?.parse().ok()?;
-        // All four must be nonzero and api_mode must be valid (watcher.c rule)
-        if obs == 0 || query == 0 || fg == 0 || (api != 1 && api != 2) { return None; }
-        Some(TxCodes { observer_code: obs, query_code: query, api_mode: api, fg_code: fg })
-    }
-
-    pub fn write_tx_cache(cache_path: &str, codes: &TxCodes) {
-        let _ = std::fs::create_dir_all(
-            std::path::Path::new(cache_path).parent().unwrap_or(std::path::Path::new("/"))
-        );
-        let _ = std::fs::write(
-            cache_path,
-            format!("{} {} {} {}\n", codes.observer_code, codes.query_code, codes.api_mode, codes.fg_code),
-        );
-    }
-
-    pub fn resolve_tx_codes(_cache_path: &str) -> Result<TxCodes, CoreError> {
+    pub fn resolve_tx_codes() -> Result<TxCodes, CoreError> {
         let (obs, query, api, fg) = dex::resolve_tx_codes_from_dex()
             .ok_or_else(|| CoreError::binder(-1, "tx_code_resolution:dex_parse_failed"))?;
         Ok(TxCodes { observer_code: obs, query_code: query, api_mode: api, fg_code: fg })
@@ -363,10 +341,10 @@ mod imp {
 
         /// Open ActivityManager binder (polling mode — no observer).
         /// Resolves the query tx code from cache or DEX.
-        pub fn open(cache_path: &str) -> Result<Self, CoreError> {
+        pub fn open() -> Result<Self, CoreError> {
             let handle = Self::dlopen_libbinder()?;
             let (lib, vt, class, service) = Self::open_inner(handle)?;
-            let codes = resolve_tx_codes(cache_path)?;
+            let codes = resolve_tx_codes()?;
             let legacy = codes.api_mode == 2;
             Ok(Self { _lib: lib, vt, _class: class, service, tx_code: codes.query_code, legacy })
         }
@@ -376,10 +354,10 @@ mod imp {
         /// Returns `(Self, eventfd_raw_fd)`. The eventfd becomes readable
         /// whenever `onForegroundActivitiesChanged` fires. Caller must add it
         /// to epoll. After the event fires, call `get_focused_package`.
-        pub fn open_with_observer(cache_path: &str) -> Result<(Self, i32), CoreError> {
+        pub fn open_with_observer() -> Result<(Self, i32), CoreError> {
             let handle = Self::dlopen_libbinder()?;
             let (lib, vt, am_class, service) = Self::open_inner(handle)?;
-            let codes = resolve_tx_codes(cache_path)?;
+            let codes = resolve_tx_codes()?;
             let legacy = codes.api_mode == 2;
 
             // Create eventfd for callback → epoll bridge
@@ -460,12 +438,91 @@ mod imp {
             if self.legacy { parse_stack_info_body(&r) } else { parse_root_task_info_body(&r) }
         }
     }
+
+    // ── RawBinderService ──────────────────────────────────────────────────────
+
+    /// Generic binder client for any named Android service.
+    ///
+    /// Handles its own `dlopen` on `libbinder_ndk.so`. Callers provide raw
+    /// transaction codes (resolved via [`crate::dex::find_transaction_code`])
+    /// and use [`RawBinderService::transact_bool`] /
+    /// [`RawBinderService::transact_i32`] for typed round-trips.
+    pub struct RawBinderService {
+        _lib:    DlHandle,
+        vt:      Vtable,
+        service: OwnedBinder,
+    }
+    unsafe impl Send for RawBinderService {}
+
+    impl RawBinderService {
+        /// Open a connection to the named service (e.g. `"power"`, `"batterystats"`).
+        pub fn open(service_name: &str) -> Result<Self, CoreError> {
+            use std::ffi::CString;
+            let handle = unsafe {
+                libc::dlopen(LIBBINDER_PATH.as_ptr() as *const c_char, libc::RTLD_NOW | libc::RTLD_LOCAL)
+            };
+            if handle.is_null() {
+                return Err(CoreError::binder(-1, "dlopen:libbinder_ndk.so"));
+            }
+            let lib = DlHandle(handle);
+            let vt = load_vtable(handle)?;
+            let cs = CString::new(service_name)
+                .map_err(|_| CoreError::binder(-1, "service_name:nul_byte"))?;
+            let raw = unsafe { (vt.get_service)(cs.as_ptr()) };
+            if raw.is_null() {
+                return Err(CoreError::binder(-1, "AServiceManager_getService:null"));
+            }
+            let service = OwnedBinder { ptr: raw, dec_strong: vt.dec_strong };
+            Ok(Self { _lib: lib, vt, service })
+        }
+
+        /// Send a no-argument transaction; read exception header then bool reply.
+        pub fn transact_bool(&self, code: u32) -> Result<bool, CoreError> {
+            let out = self.raw_noarg(code)?;
+            let r = ParcelReader { vt: &self.vt, parcel: &out };
+            let ex = r.read_i32()?;
+            if ex != EX_NONE { return Err(CoreError::binder(ex, "transact_bool:exception")); }
+            if let Some(rb) = self.vt.read_bool {
+                let mut v = false;
+                let s = unsafe { rb(out.ptr as *const AParcel, &mut v) };
+                if s != STATUS_OK { return Err(CoreError::binder(s, "AParcel_readBool")); }
+                Ok(v)
+            } else {
+                Ok(r.read_i32()? != 0)
+            }
+        }
+
+        /// Send a transaction with one i32 argument; discard reply.
+        pub fn transact_i32(&self, code: u32, arg: i32) -> Result<(), CoreError> {
+            let mut inp: *mut AParcel = std::ptr::null_mut();
+            let s = unsafe { (self.vt.prepare_transaction)(self.service.ptr, &mut inp) };
+            if s != STATUS_OK { return Err(CoreError::binder(s, "AIBinder_prepareTransaction")); }
+            let s = unsafe { (self.vt.write_int32)(inp, arg) };
+            if s != STATUS_OK { return Err(CoreError::binder(s, "AParcel_writeInt32")); }
+            let mut out: *mut AParcel = std::ptr::null_mut();
+            let s = unsafe { (self.vt.transact)(self.service.ptr, code, &mut inp, &mut out, 0) };
+            if !out.is_null() { unsafe { (self.vt.parcel_delete)(out) }; }
+            if s != STATUS_OK { return Err(CoreError::binder(s, "AIBinder_transact")); }
+            Ok(())
+        }
+
+        fn raw_noarg(&self, code: u32) -> Result<OwnedParcel, CoreError> {
+            let mut inp: *mut AParcel = std::ptr::null_mut();
+            let s = unsafe { (self.vt.prepare_transaction)(self.service.ptr, &mut inp) };
+            if s != STATUS_OK { return Err(CoreError::binder(s, "AIBinder_prepareTransaction")); }
+            let mut out: *mut AParcel = std::ptr::null_mut();
+            let s = unsafe { (self.vt.transact)(self.service.ptr, code, &mut inp, &mut out, 0) };
+            let out = OwnedParcel { ptr: out, delete: self.vt.parcel_delete };
+            if s != STATUS_OK { return Err(CoreError::binder(s, "AIBinder_transact")); }
+            Ok(out)
+        }
+    }
 }
 
 // ── Public re-exports ─────────────────────────────────────────────────────────
 
 #[cfg(target_os = "android")]
-pub use imp::{ActivityManagerBinder, TxCodes, read_tx_cache, write_tx_cache, resolve_tx_codes};
+pub use imp::{ActivityManagerBinder, RawBinderService, TxCodes, resolve_tx_codes};
 
 // ── Non-Android stubs ─────────────────────────────────────────────────────────
 
@@ -474,10 +531,10 @@ pub struct ActivityManagerBinder;
 
 #[cfg(not(target_os = "android"))]
 impl ActivityManagerBinder {
-    pub fn open(_cache_path: &str) -> Result<Self, crate::CoreError> {
+    pub fn open() -> Result<Self, crate::CoreError> {
         Err(crate::CoreError::binder(-1, "binder:unsupported platform"))
     }
-    pub fn open_with_observer(_cache_path: &str) -> Result<(Self, i32), crate::CoreError> {
+    pub fn open_with_observer() -> Result<(Self, i32), crate::CoreError> {
         Err(crate::CoreError::binder(-1, "binder:unsupported platform"))
     }
     pub fn get_focused_package(&self) -> Result<Option<String>, crate::CoreError> {
@@ -486,13 +543,25 @@ impl ActivityManagerBinder {
 }
 
 #[cfg(not(target_os = "android"))]
+pub struct RawBinderService;
+
+#[cfg(not(target_os = "android"))]
+impl RawBinderService {
+    pub fn open(_service_name: &str) -> Result<Self, crate::CoreError> {
+        Err(crate::CoreError::binder(-1, "binder:unsupported platform"))
+    }
+    pub fn transact_bool(&self, _code: u32) -> Result<bool, crate::CoreError> {
+        Err(crate::CoreError::binder(-1, "binder:unsupported platform"))
+    }
+    pub fn transact_i32(&self, _code: u32, _arg: i32) -> Result<(), crate::CoreError> {
+        Err(crate::CoreError::binder(-1, "binder:unsupported platform"))
+    }
+}
+
+#[cfg(not(target_os = "android"))]
 pub struct TxCodes { pub observer_code: u32, pub query_code: u32, pub api_mode: u8, pub fg_code: u32 }
 
 #[cfg(not(target_os = "android"))]
-pub fn read_tx_cache(_: &str) -> Option<TxCodes> { None }
-#[cfg(not(target_os = "android"))]
-pub fn write_tx_cache(_: &str, _: &TxCodes) {}
-#[cfg(not(target_os = "android"))]
-pub fn resolve_tx_codes(_: &str) -> Result<TxCodes, crate::CoreError> {
+pub fn resolve_tx_codes() -> Result<TxCodes, crate::CoreError> {
     Err(crate::CoreError::binder(-1, "binder:unsupported platform"))
 }
