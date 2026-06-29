@@ -41,7 +41,10 @@ mod imp {
     const AM_DESCRIPTOR:    &[u8] = b"android.app.IActivityManager\0";
     const OBS_DESCRIPTOR:   &[u8] = b"android.app.IProcessObserver\0";
     const ACTIVITY_SERVICE: &[u8] = b"activity\0";
-    const LIBBINDER_PATH:   &[u8] = b"/system/lib64/libbinder_ndk.so\0";
+    #[cfg(target_pointer_width = "64")]
+    const LIBBINDER_PATH: &[u8] = b"/system/lib64/libbinder_ndk.so\0";
+    #[cfg(target_pointer_width = "32")]
+    const LIBBINDER_PATH: &[u8] = b"/system/lib/libbinder_ndk.so\0";
 
     // ── Tx code cache ─────────────────────────────────────────────────────────
     // Format (watcher.c compatible): observer_code query_code api_mode fg_code
