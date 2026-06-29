@@ -79,20 +79,17 @@ impl Logger {
 
 /// Write a message using the platform default logger.
 ///
-/// No-op in release builds (`debug_assertions` off). All `log_*` macros
-/// call this, so logging is stripped entirely from release binaries.
+/// In release builds (`debug_assertions` off), Verbose/Debug/Info/Warn are
+/// stripped. Error and Fatal always emit regardless of build profile.
 pub fn log(level: LogLevel, tag: &str, msg: &str) {
-    #[cfg(debug_assertions)]
-    {
-        #[cfg(target_os = "android")]
-        { android::log(level, tag, msg); }
-        #[cfg(not(target_os = "android"))]
-        { stderr::log(level, tag, msg); }
-    }
     #[cfg(not(debug_assertions))]
-    {
-        let _ = (level, tag, msg);
+    if (level as i32) < (LogLevel::Error as i32) {
+        return;
     }
+    #[cfg(target_os = "android")]
+    { android::log(level, tag, msg); }
+    #[cfg(not(target_os = "android"))]
+    { stderr::log(level, tag, msg); }
 }
 
 /// Legacy alias for [`log`].
