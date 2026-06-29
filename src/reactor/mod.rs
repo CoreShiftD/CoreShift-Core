@@ -199,6 +199,29 @@ impl Fd {
         self.write_raw(buf.as_ptr(), buf.len())
     }
 
+    /// Read a native-endian `u64`, blocking until data is available.
+    ///
+    /// Unlike `read_u64`, this never returns `Ok(None)` — it retries on `EINTR`
+    /// and returns `Err` only on a hard I/O failure. Intended for blocking
+    /// eventfds used as inter-thread notification primitives.
+    pub fn read_u64_blocking(&self) -> Result<u64, CoreError> {
+        let mut bytes = [0u8; std::mem::size_of::<u64>()];
+        loop {
+            let n = unsafe {
+                libc::read(self.0, bytes.as_mut_ptr() as *mut libc::c_void, bytes.len())
+            };
+            if n == bytes.len() as isize {
+                return Ok(u64::from_ne_bytes(bytes));
+            }
+            if n < 0 {
+                let e = errno();
+                if e == libc::EINTR { continue; }
+                return Err(CoreError::sys(e, "read_u64_blocking"));
+            }
+            return Err(CoreError::sys(libc::EIO, "read_u64_blocking:short_read"));
+        }
+    }
+
     /// Read a native-endian `u64`.
     ///
     /// Returns `Ok(None)` if the operation would block (`EAGAIN`).
