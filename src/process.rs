@@ -101,6 +101,9 @@ pub unsafe fn redirect_fd_to(src_fd: i32, dst_fd: i32) {
     }
 }
 
+pub fn getuid() -> u32 { unsafe { libc::getuid() } }
+pub fn getgid() -> u32 { unsafe { libc::getgid() } }
+
 /// Drop process privileges to the given UID (`setresuid`).
 ///
 /// Sets real, effective, and saved UID to `uid`.
