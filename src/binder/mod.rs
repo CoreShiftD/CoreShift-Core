@@ -442,6 +442,149 @@ mod imp {
         }
     }
 
+    // ── DisplayManagerBinder ─────────────────────────────────────────────────
+
+    const DISPLAY_SERVICE:    &[u8] = b"display\0";
+    const DISPLAY_DESCRIPTOR: &[u8] = b"android.hardware.display.IDisplayManager\0";
+    const CALLBACK_DESCRIPTOR: &[u8] = b"android.hardware.display.IDisplayManagerCallback\0";
+    const POWER_SERVICE:      &[u8] = b"power\0";
+
+    const TX_DISPLAY_REGISTER_CALLBACK: u32 = 4;
+
+    static DISP_EVENTFD: AtomicI32 = AtomicI32::new(-1);
+
+    unsafe extern "C" fn disp_cb_on_create(_: *mut c_void) -> *mut c_void { std::ptr::null_mut() }
+    unsafe extern "C" fn disp_cb_on_destroy(_: *mut c_void) {}
+    unsafe extern "C" fn disp_cb_on_transact(
+        _: *mut AIBinder, code: u32, _: *const AParcel, _: *mut AParcel,
+    ) -> BinderStatus {
+        if code == 1 {
+            let efd = DISP_EVENTFD.load(Ordering::Relaxed);
+            if efd >= 0 {
+                let val: u64 = 1;
+                unsafe { libc::write(efd, &val as *const u64 as *const c_void, 8) };
+            }
+        }
+        STATUS_OK
+    }
+
+    pub struct DisplayManagerBinder {
+        _lib:           DlHandle,
+        vt:             Vtable,
+        display:        OwnedBinder,
+        power:          Option<OwnedBinder>,
+        is_interactive_tx: u32,
+    }
+    unsafe impl Send for DisplayManagerBinder {}
+
+    impl DisplayManagerBinder {
+        pub fn open_with_callback() -> Result<(Self, crate::reactor::Fd), CoreError> {
+            let handle = unsafe {
+                libc::dlopen(LIBBINDER_PATH.as_ptr() as *const c_char, libc::RTLD_NOW | libc::RTLD_LOCAL)
+            };
+            if handle.is_null() { return Err(CoreError::binder(-1, "dlopen:libbinder_ndk.so")); }
+            let lib = DlHandle(handle);
+            let vt = load_vtable(handle)?;
+
+            // Blocking eventfd (no EFD_NONBLOCK) — callback writes, caller's
+            // read_u64_blocking() waits. Raw fd stored in static for the callback.
+            let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+            if efd < 0 { return Err(CoreError::sys(unsafe { *libc::__errno() }, "eventfd")); }
+            DISP_EVENTFD.store(efd, Ordering::Relaxed);
+
+            // Get display service (no class_define needed for client-only)
+            let raw_display = unsafe { (vt.get_service)(DISPLAY_SERVICE.as_ptr() as *const c_char) };
+            if raw_display.is_null() {
+                unsafe { libc::close(efd) };
+                return Err(CoreError::binder(-1, "AServiceManager_getService:display"));
+            }
+            let display = OwnedBinder { ptr: raw_display, dec_strong: vt.dec_strong };
+
+            // Define IDisplayManagerCallback (we're the server receiving callbacks)
+            let cb_class = unsafe {
+                (vt.class_define)(
+                    CALLBACK_DESCRIPTOR.as_ptr() as *const c_char,
+                    disp_cb_on_create, disp_cb_on_destroy, disp_cb_on_transact,
+                )
+            };
+            if cb_class.is_null() {
+                unsafe { libc::close(efd) };
+                return Err(CoreError::binder(-1, "AIBinder_Class_define:DisplayCallback"));
+            }
+
+            let cb_binder = unsafe { (vt.new_binder)(cb_class, std::ptr::null_mut()) };
+            if cb_binder.is_null() {
+                unsafe { libc::close(efd) };
+                return Err(CoreError::binder(-1, "AIBinder_new:DisplayCallback"));
+            }
+
+            // registerCallback(callback) — tx 4
+            let mut in_ptr: *mut AParcel = std::ptr::null_mut();
+            let s = unsafe { (vt.prepare_transaction)(display.ptr, &mut in_ptr) };
+            if s != STATUS_OK {
+                unsafe { libc::close(efd) };
+                return Err(CoreError::binder(s, "prepareTransaction:registerCallback"));
+            }
+            unsafe { (vt.write_strong_binder)(in_ptr, cb_binder) };
+            let mut out_ptr: *mut AParcel = std::ptr::null_mut();
+            let s = unsafe {
+                (vt.transact)(display.ptr, TX_DISPLAY_REGISTER_CALLBACK, &mut in_ptr, &mut out_ptr, 0)
+            };
+            if !out_ptr.is_null() { unsafe { (vt.parcel_delete)(out_ptr) }; }
+            if s != STATUS_OK {
+                unsafe { libc::close(efd) };
+                return Err(CoreError::binder(s, "transact:registerCallback"));
+            }
+
+            // Optional: grab power service for is_interactive()
+            let power = {
+                let raw = unsafe { (vt.get_service)(POWER_SERVICE.as_ptr() as *const c_char) };
+                if raw.is_null() { None } else { Some(OwnedBinder { ptr: raw, dec_strong: vt.dec_strong }) }
+            };
+
+            // Resolve isInteractive tx code from DEX at open time
+            let is_interactive_tx = crate::dex::resolve_is_interactive_tx()
+                .ok_or_else(|| CoreError::binder(-1, "dex:TRANSACTION_isInteractive not found"))?;
+
+            // Join binder thread pool so callbacks can fire
+            unsafe { (vt.set_thread_pool_max)(0) };
+            let join_fn = vt.join_thread_pool;
+            std::thread::spawn(move || unsafe { join_fn() });
+
+            // Wrap raw fd for safe ownership transfer to caller
+            let efd_owned = unsafe {
+                crate::reactor::Fd::from_owned_raw_fd(efd, "display.efd")
+                    .map_err(|_| CoreError::binder(-1, "Fd::from_owned_raw_fd:display.efd"))?
+            };
+            Ok((Self { _lib: lib, vt, display, power, is_interactive_tx }, efd_owned))
+        }
+
+        pub fn is_interactive(&self) -> Result<bool, CoreError> {
+            let power = self.power.as_ref()
+                .ok_or_else(|| CoreError::binder(-1, "power:unavailable"))?;
+            let mut inp: *mut AParcel = std::ptr::null_mut();
+            let s = unsafe { (self.vt.prepare_transaction)(power.ptr, &mut inp) };
+            if s != STATUS_OK { return Err(CoreError::binder(s, "prepareTransaction:isInteractive")); }
+            let mut out: *mut AParcel = std::ptr::null_mut();
+            let s = unsafe {
+                (self.vt.transact)(power.ptr, self.is_interactive_tx, &mut inp, &mut out, 0)
+            };
+            let out = OwnedParcel { ptr: out, delete: self.vt.parcel_delete };
+            if s != STATUS_OK { return Err(CoreError::binder(s, "transact:isInteractive")); }
+            let r = ParcelReader { vt: &self.vt, parcel: &out };
+            let ex = r.read_i32()?;
+            if ex != EX_NONE { return Err(CoreError::binder(ex, "isInteractive:exception")); }
+            if let Some(rb) = self.vt.read_bool {
+                let mut v = false;
+                let s = unsafe { rb(out.ptr as *const AParcel, &mut v) };
+                if s != STATUS_OK { return Err(CoreError::binder(s, "readBool:isInteractive")); }
+                Ok(v)
+            } else {
+                Ok(r.read_i32()? != 0)
+            }
+        }
+    }
+
     // ── RawBinderService ──────────────────────────────────────────────────────
 
     /// Generic binder client for any named Android service.
@@ -525,7 +668,7 @@ mod imp {
 // ── Public re-exports ─────────────────────────────────────────────────────────
 
 #[cfg(target_os = "android")]
-pub use imp::{ActivityManagerBinder, RawBinderService, TxCodes, resolve_tx_codes};
+pub use imp::{ActivityManagerBinder, DisplayManagerBinder, RawBinderService, TxCodes, resolve_tx_codes};
 
 // ── Non-Android stubs ─────────────────────────────────────────────────────────
 
@@ -541,6 +684,19 @@ impl ActivityManagerBinder {
         Err(crate::CoreError::binder(-1, "binder:unsupported platform"))
     }
     pub fn get_focused_package(&self) -> Result<Option<String>, crate::CoreError> {
+        Err(crate::CoreError::binder(-1, "binder:unsupported platform"))
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+pub struct DisplayManagerBinder;
+
+#[cfg(not(target_os = "android"))]
+impl DisplayManagerBinder {
+    pub fn open_with_callback() -> Result<(Self, crate::reactor::Fd), crate::CoreError> {
+        Err(crate::CoreError::binder(-1, "binder:unsupported platform"))
+    }
+    pub fn is_interactive(&self) -> Result<bool, crate::CoreError> {
         Err(crate::CoreError::binder(-1, "binder:unsupported platform"))
     }
 }

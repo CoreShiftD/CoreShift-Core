@@ -329,3 +329,9 @@ pub fn resolve_tx_codes_from_dex() -> Option<(u32, u32, u8, u32)> {
     let query_code = find_transaction_code(JAR, AM_STUB, "TRANSACTION_getFocusedStackInfo")?;
     Some((observer_code, query_code, 2, fg_code))
 }
+
+/// Resolve `IPowerManager.isInteractive()` transaction code from DEX.
+pub fn resolve_is_interactive_tx() -> Option<u32> {
+    const JAR: &str = "/system/framework/framework.jar";
+    find_transaction_code(JAR, "Landroid/os/IPowerManager$Stub;", "TRANSACTION_isInteractive")
+}
