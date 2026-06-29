@@ -126,9 +126,22 @@ pub fn setgid(gid: u32) -> Result<(), CoreError> {
 
 /// Close all file descriptors >= `start`.
 ///
-/// Silently ignores `EBADF` (already closed or never open).
+/// Enumerates `/proc/self/fd` to avoid EBADF on sparse fd tables.
+/// Falls back to a blind 3..1024 scan if `/proc/self/fd` is unreadable.
 pub fn close_fds_from(start: i32) {
-    for fd in start..1024 {
-        unsafe { libc::close(fd) };
+    if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+        let fds: Vec<i32> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+            .filter(|&fd| fd >= start)
+            .collect();
+        // entries is dropped here, closing the readdir fd before we iterate fds
+        for fd in fds {
+            unsafe { libc::close(fd) };
+        }
+    } else {
+        for fd in start..1024 {
+            unsafe { libc::close(fd) };
+        }
     }
 }
