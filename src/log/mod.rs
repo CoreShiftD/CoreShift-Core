@@ -79,16 +79,19 @@ impl Logger {
 
 /// Write a message using the platform default logger.
 ///
-/// This maintains compatibility with legacy callers and existing macros.
-/// It uses direct compile-time dispatch to the appropriate platform backend.
+/// No-op in release builds (`debug_assertions` off). All `log_*` macros
+/// call this, so logging is stripped entirely from release binaries.
 pub fn log(level: LogLevel, tag: &str, msg: &str) {
-    #[cfg(target_os = "android")]
+    #[cfg(debug_assertions)]
     {
-        android::log(level, tag, msg);
+        #[cfg(target_os = "android")]
+        { android::log(level, tag, msg); }
+        #[cfg(not(target_os = "android"))]
+        { stderr::log(level, tag, msg); }
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(debug_assertions))]
     {
-        stderr::log(level, tag, msg);
+        let _ = (level, tag, msg);
     }
 }
 
